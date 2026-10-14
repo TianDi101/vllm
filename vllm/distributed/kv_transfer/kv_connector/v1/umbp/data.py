@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from enum import StrEnum
+from functools import cache
 from typing import Any, NamedTuple, overload
 
 import torch
@@ -297,15 +298,7 @@ class BlockIdentityCodec:
     ) -> str:
         if not isinstance(block_hash, bytes) or not block_hash:
             raise ValueError("block_hash must be non-empty bytes")
-        if group_id < 0:
-            raise ValueError("group_id must be non-negative")
-        tp_rank, pcp_rank, dcp_rank, pp_rank = namespace
-        return (
-            f"umbp:vllm:v1:{self.namespace.value}:"
-            f"tp{tp_rank}:pcp{pcp_rank}:dcp{dcp_rank}:"
-            f"pp{pp_rank}:g{group_id}:"
-            f"{block_hash.hex()}"
-        )
+        return _key_prefix(self.namespace.value, namespace, group_id) + block_hash.hex()
 
     def keys_for_topology(
         self,
@@ -313,11 +306,40 @@ class BlockIdentityCodec:
         topology: RankTopology,
         group_ids: Sequence[int],
     ) -> tuple[str, ...]:
+        if not isinstance(block_hash, bytes) or not block_hash:
+            raise ValueError("block_hash must be non-empty bytes")
+        # Hash-granular lookups build these for every probed position, so the
+        # rank and group part is formatted once per topology, not per key.
+        hash_hex = block_hash.hex()
         return tuple(
-            self.key_for_namespace(block_hash, group_id, namespace)
-            for namespace in topology.all_namespaces()
-            for group_id in group_ids
+            prefix + hash_hex
+            for prefix in _topology_key_prefixes(
+                self.namespace.value, topology, tuple(group_ids)
+            )
         )
+
+
+@cache
+def _key_prefix(namespace: str, rank: tuple[int, int, int, int], group_id: int) -> str:
+    if group_id < 0:
+        raise ValueError("group_id must be non-negative")
+    tp_rank, pcp_rank, dcp_rank, pp_rank = rank
+    return (
+        f"umbp:vllm:v1:{namespace}:"
+        f"tp{tp_rank}:pcp{pcp_rank}:dcp{dcp_rank}:"
+        f"pp{pp_rank}:g{group_id}:"
+    )
+
+
+@cache
+def _topology_key_prefixes(
+    namespace: str, topology: RankTopology, group_ids: tuple[int, ...]
+) -> tuple[str, ...]:
+    return tuple(
+        _key_prefix(namespace, rank, group_id)
+        for rank in topology.all_namespaces()
+        for group_id in group_ids
+    )
 
 
 @dataclass(frozen=True)

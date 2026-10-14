@@ -13,6 +13,7 @@ from tests.v1.kv_connector.umbp_test_utils import (
     _kv_cache_config,
     _SchedulerHandle,
     _vllm_config,
+    make_scheduler_output,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.data import (
     BlockIdentityCodec,
@@ -98,6 +99,68 @@ def test_scheduler_async_lookup_defers_then_returns_hit(monkeypatch):
     assert result == (16, False)
     assert key_calls == 1
     assert context_builds == 1
+
+
+def test_async_lookup_answered_within_wait_is_used_immediately():
+    class _AllHits(_SchedulerHandle):
+        def lookup(self, keys):
+            return [True] * len(keys)
+
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config({"lookup_async": True, "load_async": False}),
+        _kv_cache_config(),
+        _AllHits([]),
+        BlockIdentityCodec(UMBPNamespace("sync-wait")),
+    )
+    request = SimpleNamespace(
+        request_id="fast", num_tokens=32, block_hashes=[b"a", b"b"]
+    )
+    try:
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (16, False)
+        assert scheduler._pending_lookups == {}
+    finally:
+        scheduler.close()
+
+
+def test_async_lookup_wait_budget_spans_one_schedule_pass(monkeypatch):
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config(
+            {
+                "lookup_async": True,
+                "lookup_sync_wait_ms": 20,
+                "lookup_sync_budget_ms": 30,
+            }
+        ),
+        _kv_cache_config(),
+        _SchedulerHandle([]),
+        BlockIdentityCodec(UMBPNamespace("wait-budget")),
+    )
+    futures: list[Future[list[bool]]] = []
+
+    def submit(fn, keys):
+        future: Future[list[bool]] = Future()
+        futures.append(future)
+        return future
+
+    monkeypatch.setattr(scheduler._lookup_executor, "submit", submit)
+    requests = [
+        SimpleNamespace(request_id=name, num_tokens=32, block_hashes=[b"a", b"b"])
+        for name in ("a", "b", "c")
+    ]
+    try:
+        started = time.monotonic()
+        for request in requests:
+            assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+        # 20 ms for the first lookup, the remaining 10 ms for the second, none
+        # for the third.
+        assert time.monotonic() - started < 0.5
+        assert scheduler._lookup_budget_left_s <= 0
+        assert len(futures) == 3
+
+        scheduler.build_connector_meta(make_scheduler_output())
+        assert scheduler._lookup_budget_left_s == pytest.approx(0.03)
+    finally:
+        scheduler.close()
 
 
 @pytest.mark.parametrize("change", ["local", "length", "hash", "request"])

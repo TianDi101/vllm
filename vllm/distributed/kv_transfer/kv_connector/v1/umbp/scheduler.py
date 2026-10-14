@@ -9,6 +9,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from itertools import islice
@@ -238,6 +239,14 @@ class UMBPStoreConnectorScheduler:
             self.load_async = True
         self.enable_lookup = bool(extra.get("enable_lookup", True))
         self.lookup_async = bool(extra.get("lookup_async", False))
+        # An async lookup defers its request by a whole engine step, though most
+        # answer within milliseconds: wait this long first so the request can
+        # run now. The per-pass budget bounds how long one schedule() blocks.
+        self._lookup_wait_s = float(extra.get("lookup_sync_wait_ms", 20)) / 1000
+        self._lookup_pass_budget_s = (
+            float(extra.get("lookup_sync_budget_ms", 50)) / 1000
+        )
+        self._lookup_budget_left_s = self._lookup_pass_budget_s
         self.save_decode_cache = bool(extra.get("save_decode_cache", False))
         # A kv_consumer only restores from the pool, as with other store
         # connectors; it never offloads its own KV.
@@ -423,11 +432,13 @@ class UMBPStoreConnectorScheduler:
         if pending is None:
             context = self._build_lookup_context(request, num_computed_tokens, hashes)
             if self.lookup_async:
-                self._pending_lookups[request.request_id] = _PendingLookup(
+                pending = _PendingLookup(
                     context,
                     self._lookup_executor.submit(self._lookup_all_ranks, context.keys),
                 )
-                return None, False
+                if not self._await_lookup(pending.future):
+                    self._pending_lookups[request.request_id] = pending
+                    return None, False
         else:
             context = self._pending_lookups.pop(request.request_id).context
         try:
@@ -522,6 +533,16 @@ class UMBPStoreConnectorScheduler:
         ):
             load_async = False
         return need_to_load, load_async
+
+    def _await_lookup(self, future: Future[Sequence[bool]]) -> bool:
+        """Whether ``future`` finished within this pass's remaining wait budget."""
+        timeout = min(self._lookup_wait_s, self._lookup_budget_left_s)
+        if timeout <= 0:
+            return future.done()
+        started = time.monotonic()
+        wait_futures((future,), timeout=timeout)
+        self._lookup_budget_left_s -= time.monotonic() - started
+        return future.done()
 
     def _lookup_all_ranks(self, keys: Sequence[str]) -> list[bool]:
         """Existence of every rank's copy of each object in ``keys``.
@@ -722,6 +743,8 @@ class UMBPStoreConnectorScheduler:
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         meta = UMBPConnectorMetadata(async_load=self.load_async)
+        # Lookups of this schedule() pass are done; the next pass gets a new budget.
+        self._lookup_budget_left_s = self._lookup_pass_budget_s
         reserved_store_keys = {
             key for event in self._store_events.values() for key in event.iter_keys()
         }
