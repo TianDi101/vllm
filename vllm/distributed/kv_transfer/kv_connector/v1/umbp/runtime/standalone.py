@@ -264,6 +264,16 @@ class _StandaloneSchedulerHandle(UMBPSchedulerHandle):
             return [False] * len(keys)
         return result
 
+    def touch(self, keys: Sequence[str]) -> None:
+        # MORI builds without BatchTouch keep commit/read recency only.
+        touch = getattr(self._client, "batch_touch", None)
+        if not callable(touch) or not keys:
+            return
+        try:
+            touch(list(keys))
+        except Exception as exc:
+            self._log_failure("touch", exc)
+
     def clear(self) -> bool:
         try:
             cleared = bool(self._call("clear"))

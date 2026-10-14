@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.forward_context import ForwardContext
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from .data import (
     BlockIdentityCodec,
@@ -157,6 +158,11 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 enable_kv_cache_events=bool(
                     vllm_config.kv_events_config
                     and vllm_config.kv_events_config.enable_kv_cache_events
+                ),
+                low_priority_group_ids=frozenset(
+                    group_id
+                    for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+                    if isinstance(group.kv_cache_spec, MambaSpec)
                 ),
             )
 

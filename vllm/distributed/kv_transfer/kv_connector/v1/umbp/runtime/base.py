@@ -24,6 +24,9 @@ class UMBPSchedulerHandle(Protocol):
     def clear(self) -> bool:
         """Clear all objects visible to this scheduler handle."""
 
+    def touch(self, keys: Sequence[str]) -> None:
+        """Count stored objects as just used without reading them (optional)."""
+
     def close(self) -> None:
         """Release scheduler-side resources."""
 
@@ -64,6 +67,9 @@ class UMBPWorkerHandle(Protocol):
 
     def take_evicted_keys(self) -> Sequence[str]:
         """Return locally published keys evicted since the last call."""
+
+    def set_eviction_class(self, keys: Sequence[str], eviction_class: int) -> None:
+        """Ask the pool to evict published objects sooner (1) or normally (0)."""
 
     def close(self) -> None:
         """Release worker-side resources."""

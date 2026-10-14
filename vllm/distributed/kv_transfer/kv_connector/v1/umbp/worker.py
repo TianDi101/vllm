@@ -50,11 +50,15 @@ class UMBPStoreConnectorWorker:
         codec: BlockIdentityCodec | None = None,
         report_failed_requests: bool = False,
         enable_kv_cache_events: bool = False,
+        low_priority_group_ids: frozenset[int] = frozenset(),
     ) -> None:
         self.runtime = runtime
         self.layout = layout
         self.codec = codec
         self.enable_kv_cache_events = enable_kv_cache_events
+        # Groups whose objects the pool should evict sooner: recurrent-state
+        # checkpoints are stored for every prompt but rarely read back.
+        self._low_priority_group_ids = low_priority_group_ids
         self._load_jobs: dict[str, dict[str | None, TransferJobState]] = {}
         self._store_jobs: dict[str, TransferJobState] = {}
         self._pending_stores: list[_StoreBatch] = []
@@ -178,7 +182,25 @@ class UMBPStoreConnectorWorker:
                 self._failed_recving.add(request_id)
         elif succeeded:
             self.runtime.publish(result)
+            self._mark_low_priority(result)
         return succeeded
+
+    def _mark_low_priority(self, result: TransferJobState) -> None:
+        set_class = getattr(self.runtime, "set_eviction_class", None)
+        if not self._low_priority_group_ids or not callable(set_class):
+            return
+        plans = result.plans
+        if isinstance(plans, (BlockLoadBatch, BlockStoreBatch)):
+            entries = zip(plans.keys, plans.group_ids, strict=True)
+        else:
+            entries = ((plan.key, plan.group_id) for plan in plans)
+        keys = [
+            key
+            for key, group_id in entries
+            if group_id in self._low_priority_group_ids and key in result.completed_keys
+        ]
+        if keys:
+            set_class(keys, 1)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if self._report_load_completions:
