@@ -1156,3 +1156,84 @@ def test_several_cache_groups_report_failed_loads_per_request(several_groups):
     assert worker.get_finished(set()) == (None, {"req"})
     assert worker.get_failed_recving() == ({"req"} if several_groups else set())
     assert worker.get_block_ids_with_load_errors() == (set() if several_groups else {3})
+
+
+@pytest.mark.parametrize(
+    ("use_eagle", "prompt_tokens", "page_hash_index"),
+    [(False, 22, 4), (True, 26, 5)],
+)
+def test_boundary_handoff_inside_attention_block_stores_attention_page(
+    monkeypatch, use_eagle, prompt_tokens, page_hash_index
+):
+    """A hybrid prefix resumes at a prompt-tail boundary only if the pool also
+    holds the attention page that boundary falls in; core hands off only the
+    state page. Eagle matches attention one hash unit past the boundary and
+    drops it, so its page is keyed one unit later."""
+    monkeypatch.setattr(
+        umbp_scheduler, "resolve_kv_cache_block_sizes", lambda *args: (16, 4)
+    )
+    hashes = [bytes([index + 1]) * 4 for index in range(8)]
+
+    def scheduler_with(hits):
+        config = _vllm_config(
+            {"mode": "embedded", "enable_partial_hash_hits": True},
+            prefix_match_unit=4,
+        )
+        if use_eagle:
+            config.speculative_config = SimpleNamespace(
+                use_eagle_block_drop=lambda: True
+            )
+        return UMBPStoreConnectorScheduler(
+            config,
+            _hybrid_kv_cache_config(),
+            _SchedulerHandle(hits),
+            BlockIdentityCodec(UMBPNamespace("attention-tail")),
+        )
+
+    first = scheduler_with({})
+    request = make_request(
+        "turn-1",
+        num_tokens=prompt_tokens,
+        block_hashes=hashes[: prompt_tokens // 4],
+        block_ids=([3, 4], [6, 7]),
+    )
+    first.update_state_after_alloc(
+        request, SimpleNamespace(get_block_ids=lambda group_ids: ([3, 4], [6, 7])), 0
+    )
+    metadata = first.build_connector_meta(
+        make_scheduler_output(
+            new_reqs=[
+                SimpleNamespace(
+                    req_id="turn-1", num_computed_tokens=0, block_ids=([3, 4], [6, 7])
+                )
+            ],
+            scheduled_tokens={"turn-1": prompt_tokens},
+            block_state=SimpleNamespace(
+                boundary_state_offloads={"turn-1": [(1, 9, 20)]}
+            ),
+        )
+    )
+    stored = {
+        plan.key: (plan.group_id, plan.block_id) for plan in metadata.iter_store_plans()
+    }
+    first.close()
+
+    # Full block [0, 16), the state at 20, and the attention page holding [16, 20).
+    assert sorted(stored.values()) == [(0, 3), (0, 4), (1, 9)]
+    assert stored[first.codec.key(hashes[page_hash_index], 0)] == (0, 4)
+
+    second = scheduler_with(dict.fromkeys(stored, True))
+    next_turn = make_request("turn-2", num_tokens=32, block_hashes=hashes)
+    assert second.get_num_new_matched_tokens(next_turn, 0) == (20, True)
+    second.update_state_after_alloc(
+        next_turn,
+        SimpleNamespace(get_block_ids=lambda group_ids: ([11, 12], [13, 14])),
+        20,
+    )
+    loads = second._pending_loads["turn-2"]
+    assert dict(zip(loads.keys, loads.block_ids)) == {
+        second.codec.key(hashes[3], 0): 11,
+        second.codec.key(hashes[page_hash_index], 0): 12,
+        second.codec.key(hashes[4], 1): 14,
+    }
+    second.close()
