@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -265,6 +266,13 @@ class UMBPStoreConnectorScheduler:
         self.store_enabled = getattr(transfer_config, "kv_role", None) != "kv_consumer"
         # Request.block_hashes are computed at this size; keys index into them.
         self.hash_block_size = resolved_hash_block_size
+        # VLLM_UMBP_HIT_LOG=1: one line per admitted request with its GPU (local)
+        # hit, pool (external) hit and an infinite-cache bound, the longest prefix
+        # of its block hashes that any earlier request produced (debug only).
+        self._hit_log = os.environ.get("VLLM_UMBP_HIT_LOG", "0") == "1"
+        self._hit_log_seen: set[Any] = set()
+        self._hit_log_local: dict[str, int] = {}
+        self._hit_log_done: set[str] = set()
         partial_hash_hits = extra.get("enable_partial_hash_hits")
         if partial_hash_hits is None:
             # Mamba "align" checkpoints sit on prompt-tail hash boundaries, which
@@ -416,6 +424,8 @@ class UMBPStoreConnectorScheduler:
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
+        if self._hit_log:
+            self._hit_log_local[request.request_id] = num_computed_tokens
         if not self.enable_lookup:
             return 0, False
         if self.runtime is None:
@@ -733,6 +743,8 @@ class UMBPStoreConnectorScheduler:
         blocks: KVCacheBlocks,
         num_external_tokens: int,
     ) -> None:
+        if self._hit_log:
+            self._log_hit(request, num_external_tokens)
         self._requests[request.request_id] = request
         block_groups = blocks.get_block_ids(
             group_ids=self.kv_cache_config.prefix_cacheable_group_ids
@@ -1368,9 +1380,39 @@ class UMBPStoreConnectorScheduler:
             )
         return mask
 
+    def _log_hit(self, request: Request, num_external_tokens: int) -> None:
+        request_id = request.request_id
+        if request_id in self._hit_log_done:
+            return  # a preempted request is re-admitted; log its first admission
+        self._hit_log_done.add(request_id)
+        local = self._hit_log_local.pop(request_id, 0)
+        hashes = list(request.block_hashes)
+        seen = self._hit_log_seen
+        shared = 0
+        for block_hash in hashes:
+            if block_hash not in seen:
+                break
+            shared += 1
+        seen.update(hashes)
+        prompt = request.num_prompt_tokens
+        logger.info(
+            "UMBP hit req=%s prompt=%d local=%d external=%d theo=%d unit=%d "
+            "block=%d hashes=%d",
+            request_id,
+            prompt,
+            local,
+            num_external_tokens,
+            min(shared * self.hash_block_size, max(prompt - 1, 0)),
+            self.hash_block_size,
+            self.block_size,
+            len(hashes),
+        )
+
     def request_finished(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
+        self._hit_log_done.discard(request.request_id)
+        self._hit_log_local.pop(request.request_id, None)
         self._pending_loads.pop(request.request_id, None)
         self._load_specs.pop(request.request_id, None)
         self._requests.pop(request.request_id, None)
