@@ -270,7 +270,9 @@ class UMBPStoreConnectorScheduler:
         # hit, pool (external) hit and an infinite-cache bound, the longest prefix
         # of its block hashes that any earlier request produced (debug only).
         self._hit_log = os.environ.get("VLLM_UMBP_HIT_LOG", "0") == "1"
-        self._hit_log_seen: set[Any] = set()
+        # block hash -> first request carrying it; request -> finish time
+        self._hit_log_seen: dict[Any, str] = {}
+        self._hit_log_finished: dict[str, float] = {}
         self._hit_log_local: dict[str, int] = {}
         self._hit_log_done: set[str] = set()
         partial_hash_hits = extra.get("enable_partial_hash_hits")
@@ -1393,25 +1395,43 @@ class UMBPStoreConnectorScheduler:
             if block_hash not in seen:
                 break
             shared += 1
-        seen.update(hashes)
         prompt = request.num_prompt_tokens
+        theo = min(shared * self.hash_block_size, max(prompt - 1, 0))
+        # Seconds since the first request carrying the block that ends at the
+        # aligned boundary below theo (and the one ending at theo) finished;
+        # -1 while it is still running (its state is not cached yet).
+        now = time.monotonic()
+        ages = []
+        for end in (theo // self.block_size * self.block_size, theo):
+            index = end // self.hash_block_size - 1
+            if end <= 0 or index >= shared:
+                ages.append(-2.0)
+                continue
+            done = self._hit_log_finished.get(seen[hashes[index]])
+            ages.append(-1.0 if done is None else now - done)
+        for block_hash in hashes:
+            seen.setdefault(block_hash, request_id)
         logger.info(
             "UMBP hit req=%s prompt=%d local=%d external=%d theo=%d unit=%d "
-            "block=%d hashes=%d",
+            "block=%d hashes=%d src_age_aligned=%.1f src_age_theo=%.1f",
             request_id,
             prompt,
             local,
             num_external_tokens,
-            min(shared * self.hash_block_size, max(prompt - 1, 0)),
+            theo,
             self.hash_block_size,
             self.block_size,
             len(hashes),
+            ages[0],
+            ages[1],
         )
 
     def request_finished(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
         self._hit_log_done.discard(request.request_id)
+        if self._hit_log:
+            self._hit_log_finished.setdefault(request.request_id, time.monotonic())
         self._hit_log_local.pop(request.request_id, None)
         self._pending_loads.pop(request.request_id, None)
         self._load_specs.pop(request.request_id, None)
