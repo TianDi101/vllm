@@ -123,10 +123,11 @@ Set these options in `kv_connector_extra_config`:
 | --- | --- | --- |
 | `load_async` | `true` | Load in the background while the request waits. Models with Mamba-style or sparse-attention indexer layers always load asynchronously, since those layers read restored state before a synchronous load could have landed. |
 | `lookup_async` | `false` | Look up the pool off the scheduler thread; the request waits until the lookup completes. |
+| `lookup_sync_wait_ms`, `lookup_sync_budget_ms` | `20`, `50` | With `lookup_async`, how long a request's lookup is awaited before it is deferred to a later step, and the total such waiting per scheduler pass. Most lookups answer within milliseconds, so the request can usually run in the same step. |
 | `kv_event_max_objects` | `65536` | Maximum objects tracked for KV events. When full, new stored-object notifications are suppressed until tracked objects leave the pool. Storage and lookup continue normally. |
 | `enable_lookup` | `true` | Restore from the pool. With `false` the connector only stores. |
 | `save_decode_cache` | `false` | Also store blocks produced by decoding. |
-| `enable_partial_hash_hits` | `false` | Allow hits that end inside a block, at core's prefix-match unit (`cache_config.prefix_match_unit`). |
+| `enable_partial_hash_hits` | `false`; `true` for Mamba "align" hybrid models whose prefix-match unit is finer than the scheduler block | Allow hits that end inside a block, at core's prefix-match unit (`cache_config.prefix_match_unit`). A hybrid model's state checkpoints sit on prompt-tail hash boundaries, so block-granular lookup almost never hits. |
 | `num_workers`, `timeout_ms` | `4`, `30000` | Transfer threads per worker, and the transfer timeout. A synchronous wait that times out fails the step rather than reusing its blocks. |
 | `key_namespace` | derived | Overrides the namespace derived from the model, revision, KV layout, cache groups, parallel topology and draft model. |
 
@@ -135,6 +136,26 @@ examples above. An object can be evicted between lookup and load; the default
 `fail` policy fails the request instead of recomputing it.
 
 With `kv_role: "kv_consumer"` the connector only restores and never stores.
+
+## Eviction hints
+
+Each pool evicts least recently used objects once it crosses its high
+watermark. Two hints keep that order useful when the GPU cache sits in front
+of it:
+
+- When a request hits its prefix in the GPU cache, the connector marks the
+  pool's copies of the blocks and state checkpoint behind the hit as recently
+  used. Without this, the hottest prefixes, which are never read back from the
+  pool, would age from their first store and be evicted first.
+- Objects of Mamba-style groups, which are stored for every prompt but rarely
+  read back, are put in a low-priority class. When the pool picks between its
+  oldest normal and oldest low-priority object, the latter's age counts
+  `UMBP_LOW_CLASS_AGE_WEIGHT` times (default `1`, one plain LRU order). Set it
+  in the environment of the process that owns the pool: the engine in embedded
+  mode, `umbp_standalone_server` in standalone mode.
+
+Both need a MORI build with `BatchTouch` and `BatchSetEvictionClass`; with an
+older build they are skipped.
 
 ## Limitations
 
