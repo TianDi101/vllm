@@ -658,12 +658,20 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
+        # The kernel writes one state per chunk, at its end, so a periodic
+        # retention boundary (`prefix_cache_retention_interval`) holds a state
+        # only if a chunk ends there; stop at it instead of running past.
+        retention = self.cache_config.prefix_cache_retention_interval
+        if retention is None:
+            retention = self.block_size
+        retention_stop = (start // retention + 1) * retention if retention else 0
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
             if start % block_size != 0 and not use_internal_checkpoint
             else 0,
+            retention_stop if retention_stop < request.num_prompt_tokens else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
             # Stop at the prompt checkpoint unless the backend saves it internally.
