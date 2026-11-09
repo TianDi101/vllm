@@ -2002,6 +2002,7 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
+                self._offer_checkpoint_boundary(request)
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):
@@ -2029,6 +2030,26 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
+
+    def _offer_checkpoint_boundary(self, request: Request) -> None:
+        """Offer an exported prefill checkpoint, re-keyed this step, to the connector.
+
+        The kernel writes the checkpoint into its reserved block, a committed
+        boundary state like a retained full block, but only blocks newly cached at
+        block granularity are offered above. Without this the connector never
+        stores a prompt-tail state, and a later request resuming there loads or
+        recomputes from the previous retained block boundary.
+        """
+        checkpoint = self._checkpoints.get(request.request_id)
+        if checkpoint is None:
+            return
+        position, block_idx = checkpoint
+        block = self.req_to_blocks[request.request_id][block_idx]
+        if block.is_null or block.block_hash_num_tokens != position:
+            return
+        self._pending_boundary_state_offloads.append(
+            (request.request_id, self.kv_cache_group_id, block, position)
+        )
 
     def _cache_partial_tail_block(
         self,
