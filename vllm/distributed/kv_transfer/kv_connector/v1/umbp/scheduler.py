@@ -215,6 +215,27 @@ class UMBPStoreConnectorScheduler:
         transfer_config = vllm_config.kv_transfer_config
         assert transfer_config is not None
         extra = transfer_config.kv_connector_extra_config
+        # Sliding-window and Mamba groups resume only at stored checkpoints;
+        # storing more of them than the GPU retains costs pool space only.
+        store_interval = extra.get("store_retention_interval")
+        if store_interval is not None:
+            if (
+                type(store_interval) is not int
+                or store_interval < 0
+                or store_interval % self.block_size
+            ):
+                raise ValueError(
+                    "store_retention_interval must be a non-negative multiple of "
+                    f"the scheduler block size ({self.block_size}), "
+                    f"got {store_interval!r}"
+                )
+            self._retention_interval = store_interval
+            logger.info(
+                "UMBP stores checkpoints every %d tokens "
+                "(engine prefix_cache_retention_interval=%s)",
+                self._retention_interval,
+                kv_cache_config.prefix_cache_retention_interval,
+            )
         self.load_async = bool(extra.get("load_async", True))
         if not self.load_async and (
             len(kv_cache_config.kv_cache_groups) > 1
