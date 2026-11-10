@@ -285,6 +285,67 @@ def test_single_sliding_window_stores_a_replayable_tail(use_eagle):
         scheduler.close()
 
 
+@pytest.mark.parametrize("store_retention_interval", [None, 64])
+def test_store_retention_interval_stores_periodic_tails(store_retention_interval):
+    """The pool keeps a sliding-window tail every interval even though the
+    engine retains only replay boundaries, so a request that branches inside
+    an earlier prompt resumes from the pool at the last stored tail."""
+    config = _kv_cache_config()
+    full = config.kv_cache_groups[0].kv_cache_spec
+    config.kv_cache_groups[0].kv_cache_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=full.num_kv_heads,
+        head_size=full.head_size,
+        dtype=full.dtype,
+        sliding_window=32,
+    )
+    config.prefix_cache_retention_interval = 0
+    extra = (
+        {}
+        if store_retention_interval is None
+        else {"store_retention_interval": store_retention_interval}
+    )
+    handle = _SchedulerHandle({})
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config(extra), config, handle, BlockIdentityCodec(UMBPNamespace("swa"))
+    )
+    first = make_request(
+        "first",
+        num_tokens=129,
+        block_hashes=[b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"],
+        block_ids=([1, 2, 3, 4, 5, 6, 7, 8],),
+    )
+    branch = make_request(
+        "branch",
+        num_tokens=113,
+        block_hashes=[b"a", b"b", b"c", b"d", b"x", b"y", b"z"],
+        block_ids=([11, 12, 13, 14, 15, 16, 17],),
+    )
+    try:
+        plans = scheduler._store_plans(first, RequestTracker(), 128)
+        # Two blocks cover the 32-token window ending on each stored position:
+        # the replay boundary (128) and, with the interval, tokens 64 and 128.
+        assert plans.block_ids == (
+            [7, 8] if store_retention_interval is None else [3, 4, 7, 8]
+        )
+        handle.hits = dict.fromkeys(plans.keys, True)
+        matched, _ = scheduler.get_num_new_matched_tokens(branch, 0)
+        assert matched == (0 if store_retention_interval is None else 64)
+    finally:
+        scheduler.close()
+
+
+@pytest.mark.parametrize("value", [-16, 24, True, "64"])
+def test_store_retention_interval_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="store_retention_interval"):
+        UMBPStoreConnectorScheduler(
+            _vllm_config({"store_retention_interval": value}),
+            _kv_cache_config(),
+            _SchedulerHandle({}),
+            BlockIdentityCodec(UMBPNamespace("invalid")),
+        )
+
+
 @pytest.mark.parametrize("lookup_async", [False, True])
 @pytest.mark.parametrize("chunk_object_resident", [False, True])
 def test_external_chunked_local_hit_preserves_absolute_positions(

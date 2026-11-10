@@ -132,6 +132,7 @@ Set these options in `kv_connector_extra_config`:
 | `enable_lookup` | `true` | Restore from the pool. With `false` the connector only stores. |
 | `save_decode_cache` | `false` | Also store blocks produced by decoding. |
 | `enable_partial_hash_hits` | `false` | Allow hits that end inside a block, at core's prefix-match unit (`cache_config.prefix_match_unit`). |
+| `store_retention_interval` | engine's `prefix_cache_retention_interval` | Token interval between the sliding-window and Mamba checkpoints stored to the pool, independent of what the GPU prefix cache retains. A request can resume a prefix from the pool only at such a checkpoint. `0` stores only each prompt's replay boundary. A positive value, a multiple of the scheduler block size, also stores one checkpoint every that many tokens; each costs one window of state per group in the pool and no GPU blocks. Mamba groups in `align` mode store only their boundary states and ignore it. |
 | `num_workers`, `timeout_ms` | `4`, `30000` | Transfer threads per worker, and the transfer timeout. A synchronous wait that times out fails the step rather than reusing its blocks. |
 | `key_namespace` | derived | Overrides the namespace derived from the model, revision, KV layout, cache groups, parallel topology and draft model. The pool can then hold KV from a different layout, so attention backends that require KV written by their own cache layout fall back as with other connectors. |
 
