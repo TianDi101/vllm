@@ -60,6 +60,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 ENDPOINT = "/run/umbp/test.grpc.sock"
+_STANDALONE = "vllm.distributed.kv_transfer.kv_connector.v1.umbp.runtime.standalone"
 
 
 class _DeploymentMode(enum.Enum):
@@ -1036,6 +1037,38 @@ def test_lookup_rejects_a_short_result(server, monkeypatch):
     monkeypatch.setattr(server.clients[0], "batch_exists", lambda keys: [True])
 
     assert handle.lookup(["a", "b"]) == [False, False]
+
+
+def _record_lookup_batches(server, monkeypatch, fail_from=None):
+    monkeypatch.setattr(f"{_STANDALONE}._LOOKUP_BATCH_KEYS", 2)
+    original = server.clients[0].batch_exists
+    batches = []
+
+    def batch_exists(keys):
+        batches.append(list(keys))
+        if fail_from is not None and fail_from in keys:
+            raise RuntimeError("request too large")
+        return original(keys)
+
+    monkeypatch.setattr(server.clients[0], "batch_exists", batch_exists)
+    return batches
+
+
+def test_lookup_splits_large_key_sets(server, monkeypatch):
+    handle = _runtime().create_scheduler_handle("ns", RankTopology(), None)
+    server.objects.update({"b": b"x", "e": b"x"})
+    batches = _record_lookup_batches(server, monkeypatch)
+
+    assert handle.lookup(list("abcde")) == [False, True, False, False, True]
+    assert batches == [["a", "b"], ["c", "d"], ["e"]]
+
+
+def test_lookup_misses_entirely_when_one_batch_fails(server, monkeypatch):
+    handle = _runtime().create_scheduler_handle("ns", RankTopology(), None)
+    server.objects.update({key: b"x" for key in "abc"})
+    _record_lookup_batches(server, monkeypatch, fail_from="c")
+
+    assert handle.lookup(list("abc")) == [False, False, False]
 
 
 @pytest.mark.parametrize("load_async", [False, True])

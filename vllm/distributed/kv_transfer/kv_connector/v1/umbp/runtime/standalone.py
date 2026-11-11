@@ -43,6 +43,9 @@ logger = init_logger(__name__)
 
 _UNIX_SCHEME = "unix://"
 _FAILURE_LOG_INTERVAL_S = 30.0
+# MORI answers a batch_exists request over its 64 MiB gRPC limit with all-False
+# and no error; a long DeepSeek-V4 prompt can need ~500K keys.
+_LOOKUP_BATCH_KEYS = 131072
 
 # Registered KV storages of a client left open at shutdown. The service may
 # still read or write them once it resumes, so they live until process exit.
@@ -252,15 +255,17 @@ class _StandaloneSchedulerHandle(UMBPSchedulerHandle):
     def lookup(self, keys: Sequence[str]) -> Sequence[bool]:
         if not keys:
             return []
+        keys = list(keys)
+        result: list[bool] = []
         try:
-            result = [bool(value) for value in self._call("batch_exists", list(keys))]
+            for start in range(0, len(keys), _LOOKUP_BATCH_KEYS):
+                batch = keys[start : start + _LOOKUP_BATCH_KEYS]
+                found = self._call("batch_exists", batch)
+                if len(found) != len(batch):
+                    raise ValueError(f"{len(found)} results for {len(batch)} keys")
+                result.extend(bool(value) for value in found)
         except Exception as exc:
             self._log_failure("lookup", exc)
-            return [False] * len(keys)
-        if len(result) != len(keys):
-            self._log_failure(
-                "lookup", ValueError(f"{len(result)} results for {len(keys)} keys")
-            )
             return [False] * len(keys)
         return result
 
