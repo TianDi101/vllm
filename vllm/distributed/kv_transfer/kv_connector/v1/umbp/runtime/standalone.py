@@ -274,6 +274,25 @@ class _StandaloneSchedulerHandle(UMBPSchedulerHandle):
         except Exception as exc:
             self._log_failure("touch", exc)
 
+    def lookup_direct(self, keys: Sequence[str]) -> Sequence[bool]:
+        """`lookup` without the one-at-a-time call path, for callers off the scheduler
+        thread whose answer nothing waits on (arrival prefetch)."""
+        if not keys:
+            return []
+        return [bool(value) for value in self._client.batch_exists(list(keys))]
+
+    def prefetch(self, keys: Sequence[str]) -> int:
+        """Ask the server to copy SSD-resident keys into DRAM; returns once they are
+        copied. Call it off the scheduler thread: it takes as long as the SSD reads."""
+        prefetch = getattr(self._client, "batch_prefetch", None)
+        if not callable(prefetch):
+            return 0
+        keys = list(keys)
+        copied = 0
+        for begin in range(0, len(keys), 16384):
+            copied += int(prefetch(keys[begin : begin + 16384]))
+        return copied
+
     def clear(self) -> bool:
         try:
             cleared = bool(self._call("clear"))

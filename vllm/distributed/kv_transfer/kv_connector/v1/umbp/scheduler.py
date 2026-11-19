@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -197,6 +198,23 @@ class _LookupContext:
     keys: list[str]
 
 
+@dataclass
+class _ArrivalPrefetch:
+    """One request's arrival prefetch: lookup -> (core thread) plan -> SSD-to-DRAM copy."""
+
+    request: Request
+    hashes: tuple[bytes, ...]
+    arrived: float
+    local_tokens: int = 0
+    context: Any = None
+    lookup: Future | None = None
+    copy: Future | None = None
+    tokens: int = 0  # external tokens the copy covers; the credit it holds
+    keys: int = 0
+    started: float = 0.0
+    dead: bool = False
+
+
 @dataclass(frozen=True)
 class _PendingLookup:
     context: _LookupContext
@@ -361,6 +379,61 @@ class UMBPStoreConnectorScheduler:
         self._step_log = (
             _StepLog() if os.environ.get("VLLM_UMBP_STEP_LOG", "0") == "1" else None
         )
+        # Chain-ordered recency (VLLM_UMBP_CHAIN_TOUCH=1). A prefix is loadable only as an
+        # unbroken run of pages from its start, but the pool evicts key by key in the order
+        # keys were last touched, and recency hints went out shallowest page first: the
+        # head of a prefix was the first page evicted, which stranded every page after it.
+        # With this on, hints are sent deepest page first, and when a request finishes its
+        # whole prompt is touched once more in that order (after its stores have landed),
+        # so eviction takes a prefix from its deep end and what remains stays loadable.
+        self._chain_touch = os.environ.get("VLLM_UMBP_CHAIN_TOUCH", "0") == "1"
+        self._chain_touch_delay_s = float(
+            os.environ.get("VLLM_UMBP_CHAIN_TOUCH_DELAY_S", "4")
+        )
+        self._chain_touch_stats = [0, 0]  # requests, keys
+        if self._chain_touch:
+            logger.info(
+                "UMBP-CT chain-ordered touch on, final touch %.1f s after a request finishes",
+                self._chain_touch_delay_s,
+            )
+        # Arrival prefetch (VLLM_UMBP_ARRIVAL_PREFETCH=1). A request that will load from the
+        # pool has its objects copied SSD -> DRAM while it waits in the queue, oldest request
+        # first, so the load at its first scheduling try reads DRAM. The copies of requests
+        # that have not finished may hold at most VLLM_UMBP_PREFETCH_BUDGET_BYTES of DRAM
+        # (counted as external tokens x VLLM_UMBP_PREFETCH_BYTES_PER_TOKEN); the server's own
+        # budget (UMBP_DISTRIBUTED_PREFETCH_BUDGET_BYTES) must be larger, or it drops copies
+        # that are still waiting to be read.
+        self._pf_enabled = os.environ.get("VLLM_UMBP_ARRIVAL_PREFETCH", "0") == "1"
+        self._pf_budget_tokens = int(
+            float(os.environ.get("VLLM_UMBP_PREFETCH_BUDGET_BYTES", str(16 << 30)))
+            / float(os.environ.get("VLLM_UMBP_PREFETCH_BYTES_PER_TOKEN", "19000"))
+        )
+        # Requests whose queue wait is shorter than a copy gain nothing from it.
+        self._pf_min_tokens = int(os.environ.get("VLLM_UMBP_PREFETCH_MIN_TOKENS", "0"))
+        # A copy made too early is gone before it is read: the DRAM entry tier turns over in
+        # tens of seconds. So a copy starts only when at most this many requests are ahead
+        # of its request in arrival order (requests run first come, first served); with a
+        # short queue that is the moment the request arrives.
+        self._pf_lead_reqs = int(os.environ.get("VLLM_UMBP_PREFETCH_LEAD_REQS", "12"))
+        # Every request that has arrived and has not been admitted yet, oldest first.
+        self._pf_waiting: dict[str, None] = {}
+        self._pf_entries: dict[str, _ArrivalPrefetch] = {}
+        self._pf_outstanding_tokens = 0
+        self._pf_executor = (
+            ThreadPoolExecutor(
+                max_workers=int(os.environ.get("VLLM_UMBP_PREFETCH_WORKERS", "4")),
+                thread_name_prefix="umbp-prefetch",
+            )
+            if self._pf_enabled
+            else None
+        )
+        self._pf_stats: dict[str, float] = {}
+        self._pf_log_t0 = time.monotonic()
+        if self._pf_enabled:
+            logger.info(
+                "UMBP-PF arrival prefetch on: budget=%d tokens min=%d tokens lead=%d reqs",
+                self._pf_budget_tokens, self._pf_min_tokens, self._pf_lead_reqs,
+            )
         self._step_budget = vllm_config.scheduler_config.max_num_batched_tokens
         # block hash -> first request carrying it; request -> finish time
         self._hit_log_seen: dict[Any, str] = {}
@@ -696,7 +769,11 @@ class UMBPStoreConnectorScheduler:
             self._step_log.add("await_n")
         return future.done()
 
-    def _lookup_all_ranks(self, keys: Sequence[str]) -> list[bool]:
+    def _lookup_all_ranks(
+        self,
+        keys: Sequence[str],
+        lookup: Callable[[Sequence[str]], Sequence[bool]] | None = None,
+    ) -> list[bool]:
         """Existence of every rank's copy of each object in ``keys``.
 
         ``keys`` holds ``rank_count`` consecutive keys per object, first rank
@@ -707,10 +784,12 @@ class UMBPStoreConnectorScheduler:
         one query for all keys.
         """
         per_rank = self.topology.rank_count
+        if lookup is None:
+            lookup = self.runtime.lookup
         if per_rank == 1 or len(keys) % per_rank:
-            return list(self.runtime.lookup(keys))
+            return list(lookup(keys))
         probe = keys[::per_rank]
-        first = list(self.runtime.lookup(probe))
+        first = list(lookup(probe))
         if len(first) != len(probe):
             raise RuntimeError(f"{len(first)} lookup results for {len(probe)} keys")
         held = [index for index, exists in enumerate(first) if exists]
@@ -722,7 +801,7 @@ class UMBPStoreConnectorScheduler:
             for index in held
             for rank in range(1, per_rank)
         ]
-        rest = list(self.runtime.lookup(others))
+        rest = list(lookup(others))
         if len(rest) != len(others):
             raise RuntimeError(f"{len(rest)} lookup results for {len(others)} keys")
         width = per_rank - 1
@@ -733,6 +812,239 @@ class UMBPStoreConnectorScheduler:
                 position * width : (position + 1) * width
             ]
         return hits
+
+    # ---- arrival prefetch -------------------------------------------------------------
+
+    def _pf_count(self, key: str, value: float = 1.0) -> None:
+        self._pf_stats[key] = self._pf_stats.get(key, 0.0) + value
+
+    def _pf_disable(self, where: str, exc: BaseException) -> None:
+        """A bug in this experiment must not take the engine down: log once and stop."""
+        self._pf_enabled = False
+        logger.exception("UMBP-PF disabled after an error in %s: %r", where, exc)
+
+    def on_new_request(self, request: Request) -> None:
+        """Core thread, when a request arrives: start the lookup of its pool objects."""
+        if not self._pf_enabled:
+            return
+        try:
+            self._pf_on_new_request(request)
+        except Exception as exc:  # noqa: BLE001
+            self._pf_disable("on_new_request", exc)
+
+    def _pf_on_new_request(self, request: Request) -> None:
+        if self.runtime is None or self.codec is None:
+            return
+        if not self.enable_lookup or getattr(self.runtime, "prefetch", None) is None:
+            return
+        self._pf_waiting[request.request_id] = None
+        hashes = tuple(request.block_hashes)
+        align = (
+            self.hash_block_size if self.enable_partial_hash_hits else self.block_size
+        )
+        if not hashes or request.num_tokens < max(align, self._pf_min_tokens):
+            return
+        local = self._pf_local_estimate(hashes, request.num_tokens)
+        if request.num_tokens - 1 - local < max(align, self._pf_min_tokens):
+            self._pf_count("skip_local")
+            return
+        entry = _ArrivalPrefetch(request, hashes, time.monotonic(), local)
+        assert self._pf_executor is not None
+        try:
+            entry.lookup = self._pf_executor.submit(self._pf_lookup, entry)
+        except RuntimeError:  # executor shut down
+            return
+        self._pf_entries[request.request_id] = entry
+        self._pf_count("arrivals")
+
+    def _pf_lookup(self, entry: _ArrivalPrefetch) -> list[bool]:
+        """Prefetch thread: which pool objects past the GPU-held prefix exist."""
+        # Built here, not on the core thread: a long prompt has ~10^5 keys.
+        entry.context = self._build_lookup_context(
+            entry.request, entry.local_tokens, entry.hashes
+        )
+        lookup = getattr(self.runtime, "lookup_direct", None) or self.runtime.lookup
+        return self._lookup_all_ranks(entry.context.keys, lookup)
+
+    def _pf_local_estimate(self, hashes: tuple[bytes, ...], num_tokens: int) -> int:
+        """Leading tokens the GPU cache holds now, in whole blocks (attention groups)."""
+        group_ids = self.kv_cache_config.prefix_cacheable_group_ids
+        groups = [g for g in group_ids if g not in self._boundary_handoff_groups]
+        if not groups:
+            return 0
+        tokens = 0
+        step = max(self.group_block_sizes[g] for g in groups)
+        for end in range(step, num_tokens, step):
+            index = end // self.hash_block_size - 1
+            if index >= len(hashes) or not all(
+                self._has_local_block(g, hashes[index]) for g in groups
+            ):
+                break
+            tokens = end
+        return tokens - tokens % self.block_size
+
+    def _pf_drop(self, request_id: str) -> None:
+        self._pf_waiting.pop(request_id, None)
+        entry = self._pf_entries.pop(request_id, None)
+        if entry is None:
+            return
+        entry.dead = True
+        if entry.lookup is not None:
+            entry.lookup.cancel()
+        self._pf_outstanding_tokens -= entry.tokens
+        entry.tokens = 0
+
+    def _pf_admitted(self, request_id: str) -> None:
+        """The request reached the scheduler: a copy that has not started is too late."""
+        self._pf_waiting.pop(request_id, None)
+        entry = self._pf_entries.get(request_id)
+        if entry is None:
+            return
+        if entry.copy is None:
+            self._pf_count("late")
+            self._pf_drop(request_id)
+
+    def _pf_pump(self) -> None:
+        """Core thread, once per step: plan finished lookups, start copies that are due."""
+        try:
+            self._pf_pump_once()
+        except Exception as exc:  # noqa: BLE001
+            self._pf_disable("pump", exc)
+
+    def _pf_pump_once(self) -> None:
+        if not self._pf_entries:
+            self._pf_log()
+            return
+        planned = 0
+        for ahead, request_id in enumerate(self._pf_waiting):  # arrival order
+            if ahead >= self._pf_lead_reqs:
+                break
+            entry = self._pf_entries.get(request_id)
+            if entry is None or entry.copy is not None:
+                continue
+            if entry.lookup is None or not entry.lookup.done():
+                continue
+            if entry.tokens == 0:
+                if planned >= 4:
+                    break
+                planned += 1
+                keys, tokens = self._pf_plan(entry)
+                if not keys:
+                    self._pf_count("skip_nohit")
+                    self._pf_entries.pop(request_id, None)
+                    entry.dead = True
+                    continue
+                entry.tokens, entry.keys = tokens, len(keys)
+                entry.context = keys  # the lookup context is no longer needed
+                self._pf_outstanding_tokens += tokens
+            if (
+                self._pf_outstanding_tokens > self._pf_budget_tokens
+                and self._pf_outstanding_tokens != entry.tokens
+            ):
+                # Wait for credit; it returns when older requests finish.
+                self._pf_count("budget_waits")
+                break
+            entry.started = time.monotonic()
+            assert self._pf_executor is not None
+            try:
+                entry.copy = self._pf_executor.submit(self._pf_copy, request_id, entry)
+                self._pf_count("copies")
+            except RuntimeError:
+                self._pf_drop(request_id)
+        self._pf_log()
+
+    def _pf_plan(self, entry: _ArrivalPrefetch) -> tuple[list[str], int]:
+        """Every rank's keys of the objects the request's pool hit would load now."""
+        context = entry.context
+        try:
+            hits = list(entry.lookup.result()) if entry.lookup is not None else []
+        except Exception:  # noqa: BLE001
+            return [], 0
+        if len(hits) != len(context.keys):
+            return [], 0
+        group_ids = self.kv_cache_config.prefix_cacheable_group_ids
+        per_rank = self.topology.rank_count
+        offset = 0
+        logical_hits: dict[int, list[bool]] = {}
+        for group_id in group_ids:
+            size = len(context.objects[group_id]) * per_rank
+            group_hits = hits[offset : offset + size]
+            offset += size
+            logical_hits[group_id] = (
+                group_hits
+                if per_rank == 1
+                else [
+                    all(group_hits[i : i + per_rank])
+                    for i in range(0, len(group_hits), per_rank)
+                ]
+            )
+        if self._lookup_coordinator is None:
+            return [], 0
+        local = entry.local_tokens
+        try:
+            need, block_hashes_by_group = self._coordinate_external_hits(
+                list(entry.hashes),
+                local,
+                entry.request.num_tokens - 1 - local,
+                context.objects,
+                logical_hits,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "UMBP-PF plan failed req=%s: %s", entry.request.request_id, exc
+            )
+            return [], 0
+        if need <= 0 or not block_hashes_by_group:
+            return [], 0
+        assert self.codec is not None
+        keys: list[str] = []
+        for group_index, group_id in enumerate(group_ids):
+            start_block = local // self.group_block_sizes[group_id]
+            for block_index, block_hash in enumerate(
+                block_hashes_by_group[group_index]
+            ):
+                if block_index >= start_block and block_hash is not None:
+                    keys.extend(
+                        _rank_keys(self.codec, self.topology, block_hash, group_id)
+                    )
+        return list(dict.fromkeys(keys)), need
+
+    def _pf_copy(self, request_id: str, entry: _ArrivalPrefetch) -> None:
+        """Prefetch thread: the copy itself (blocks for the SSD reads)."""
+        keys = entry.context
+        try:
+            copied = self.runtime.prefetch(keys) if not entry.dead else 0
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("UMBP-PF copy failed req=%s: %s", request_id, exc)
+            copied = -1
+        now = time.monotonic()
+        logger.info(
+            "UMBP-PF copy req=%s tokens=%d local=%d keys=%d copied=%d rpc_s=%.3f "
+            "plan_wait_s=%.3f dead=%d",
+            request_id, entry.tokens, entry.local_tokens, entry.keys, copied,
+            now - entry.started, entry.started - entry.arrived, int(entry.dead),
+        )
+
+    def _pf_log(self) -> None:
+        now = time.monotonic()
+        if now - self._pf_log_t0 < 10.0:
+            return
+        stats = self._pf_stats
+        copying = sum(
+            1
+            for e in self._pf_entries.values()
+            if e.copy is not None and not e.copy.done()
+        )
+        logger.info(
+            "UMBP-PF dt=%.1f arrivals=%d skip_local=%d skip_nohit=%d copies=%d late=%d "
+            "used=%d budget_waits=%d waiting=%d entries=%d copying=%d outstanding_tokens=%d",
+            now - self._pf_log_t0, stats.get("arrivals", 0), stats.get("skip_local", 0),
+            stats.get("skip_nohit", 0), stats.get("copies", 0), stats.get("late", 0),
+            stats.get("used", 0), stats.get("budget_waits", 0), len(self._pf_waiting),
+            len(self._pf_entries), copying, self._pf_outstanding_tokens,
+        )
+        self._pf_stats = {}
+        self._pf_log_t0 = now
 
     def _local_hit_keys(self, request: Any, hit_tokens: int) -> list[str]:
         """Every rank's objects that back ``hit_tokens`` of local prefix hit.
@@ -746,6 +1058,7 @@ class UMBPStoreConnectorScheduler:
         if hit_tokens <= 0 or not hashes:
             return []
         keys: list[str] = []
+        by_end: list[tuple[int, tuple[str, ...]]] = []
         for group_id in self.kv_cache_config.prefix_cacheable_group_ids:
             if group_id in self._boundary_handoff_groups:
                 # The hit resumes from the state checkpoint at its end. The retained
@@ -769,10 +1082,43 @@ class UMBPStoreConnectorScheduler:
             for end in ends:
                 index = end // unit - 1
                 if 0 <= index < len(hashes):
-                    keys.extend(
-                        _rank_keys(self.codec, self.topology, hashes[index], group_id)
+                    by_end.append(
+                        (end, _rank_keys(self.codec, self.topology, hashes[index], group_id))
                     )
+        if self._chain_touch:
+            # Deepest first: the pool counts later keys of one hint as more recent.
+            by_end.sort(key=lambda item: -item[0])
+        for _, rank_keys in by_end:
+            keys.extend(rank_keys)
         return list(dict.fromkeys(keys))
+
+    def _chain_touch_finished(self, request: Request) -> None:
+        """Touch a finished request's whole prompt, deepest page first, once its stores
+        have had time to land."""
+        touch = getattr(self.runtime, "touch", None)
+        if not callable(touch) or self.codec is None:
+            return
+        unit = self.hash_block_size
+        keys = self._local_hit_keys(request, request.num_prompt_tokens // unit * unit)
+        if not keys:
+            return
+        self._chain_touch_stats[0] += 1
+        self._chain_touch_stats[1] += len(keys)
+
+        def run() -> None:
+            try:
+                touch(keys)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("UMBP-CT touch failed: %s", exc)
+
+        timer = threading.Timer(self._chain_touch_delay_s, run)
+        timer.daemon = True
+        timer.start()
+        if self._chain_touch_stats[0] % 200 == 0:
+            logger.info(
+                "UMBP-CT final touches: %d requests, %d keys",
+                self._chain_touch_stats[0], self._chain_touch_stats[1],
+            )
 
     def _touch_async(self, keys: list[str]) -> None:
         touch = getattr(self.runtime, "touch", None)
@@ -868,6 +1214,24 @@ class UMBPStoreConnectorScheduler:
         blocks: KVCacheBlocks,
         num_external_tokens: int,
     ) -> None:
+        if self._pf_enabled:
+            try:
+                entry = self._pf_entries.get(request.request_id)
+                if entry is not None and entry.copy is not None and num_external_tokens > 0:
+                    self._pf_count("used")
+                    logger.info(
+                        "UMBP-PF use req=%s planned=%d loaded=%d copy_done=%d age_s=%.1f",
+                        request.request_id, entry.tokens, num_external_tokens,
+                        int(entry.copy.done()), time.monotonic() - entry.arrived,
+                    )
+                elif num_external_tokens > 0:
+                    logger.info(
+                        "UMBP-PF miss req=%s loaded=%d had_entry=%d",
+                        request.request_id, num_external_tokens, int(entry is not None),
+                    )
+                self._pf_admitted(request.request_id)
+            except Exception as exc:  # noqa: BLE001
+                self._pf_disable("admission", exc)
         if self._hit_log:
             self._log_hit(request, num_external_tokens)
         self._requests[request.request_id] = request
@@ -928,6 +1292,12 @@ class UMBPStoreConnectorScheduler:
         reserved_store_keys = {
             key for event in self._store_events.values() for key in event.iter_keys()
         }
+        if self._pf_enabled:
+            for request_id in scheduler_output.finished_req_ids:
+                self._pf_drop(request_id)
+            for new_request in scheduler_output.scheduled_new_reqs:
+                self._pf_waiting.pop(new_request.req_id, None)
+            self._pf_pump()
         for request_id in scheduler_output.finished_req_ids:
             self._pending_loads.pop(request_id, None)
             self._load_specs.pop(request_id, None)
@@ -1590,6 +1960,14 @@ class UMBPStoreConnectorScheduler:
     def request_finished(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
+        if self._pf_enabled:
+            self._pf_drop(request.request_id)
+        if self._chain_touch:
+            try:
+                self._chain_touch_finished(request)
+            except Exception as exc:  # noqa: BLE001
+                self._chain_touch = False
+                logger.exception("UMBP-CT disabled after an error: %r", exc)
         self._hit_log_done.discard(request.request_id)
         if self._hit_log:
             self._hit_log_finished.setdefault(request.request_id, time.monotonic())
@@ -1898,6 +2276,8 @@ class UMBPStoreConnectorScheduler:
 
     def close(self) -> None:
         self._lookup_executor.shutdown(wait=True, cancel_futures=True)
+        if self._pf_executor is not None:
+            self._pf_executor.shutdown(wait=False, cancel_futures=True)
         self._pending_lookups.clear()
         if self.runtime is not None:
             self.runtime.close()

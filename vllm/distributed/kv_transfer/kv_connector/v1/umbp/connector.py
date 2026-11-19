@@ -220,6 +220,12 @@ class UMBPStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
+    def on_new_request(self, request: Request) -> None:
+        # Arrival prefetch (VLLM_UMBP_ARRIVAL_PREFETCH=1): SSD -> DRAM copies of the pool
+        # objects this request will load, started while it waits in the queue.
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.on_new_request(request)
+
     def update_state_after_alloc(
         self,
         request: Request,
