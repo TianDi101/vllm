@@ -947,3 +947,46 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()
+
+
+# ---- prefix-hit debug wrappers (image patch, VLLM_PREFIX_HIT_DEBUG=1) ----
+import os as _phd_os
+
+if _phd_os.environ.get("VLLM_PREFIX_HIT_DEBUG") == "1":
+    from vllm.logger import init_logger as _phd_init_logger
+
+    _phd_logger = _phd_init_logger("vllm.prefix_hit_debug")
+
+    _phd_orig_gcbc = KVCacheManager.get_computed_blocks_for_connector
+    _phd_orig_gcb = KVCacheManager.get_computed_blocks
+
+    def _phd_gcbc(self, request, max_cache_hit_length=None):
+        result = _phd_orig_gcbc(self, request, max_cache_hit_length)
+        try:
+            coord = self.coordinator
+            per_group = ()
+            if hasattr(coord, "find_longest_cache_hit_per_group"):
+                _, per_group = coord.find_longest_cache_hit_per_group(
+                    request.block_hashes,
+                    request.get_max_cache_hit_length(max_cache_hit_length),
+                )
+            _phd_logger.info(
+                "PHD local req=%s prompt=%d computed=%d local=%d diverged=%s groups=%s",
+                request.request_id, request.num_prompt_tokens,
+                request.num_computed_tokens, result[1], result[3],
+                sorted(set(per_group)),
+            )
+        except Exception as exc:  # debug only
+            _phd_logger.info("PHD local log failed: %r", exc)
+        return result
+
+    def _phd_gcb(self, request, max_cache_hit_length=None):
+        result = _phd_orig_gcb(self, request, max_cache_hit_length)
+        _phd_logger.info(
+            "PHD recon req=%s prompt=%d hit=%d shared_prefix=%d",
+            request.request_id, request.num_prompt_tokens, result[1], result[2],
+        )
+        return result
+
+    KVCacheManager.get_computed_blocks_for_connector = _phd_gcbc
+    KVCacheManager.get_computed_blocks = _phd_gcb

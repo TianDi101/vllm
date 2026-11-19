@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import os
+import time
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import cast
 
@@ -73,6 +76,53 @@ class UMBPStoreConnectorWorker:
         self._report_load_completions = False
         self._active_store_event = -1
         self._stats = UMBPStoreConnectorStats()
+        # PHD wstore: rank-0 store-job completion log (debug overlay).
+        self._phd = os.environ.get("VLLM_PREFIX_HIT_DEBUG") == "1" and (
+            codec is None or codec.tp_rank == 0
+        )
+        self._phd_t: dict[int, tuple[float, str]] = {}
+        # K3WSTEP (VLLM_UMBP_STEP_LOG=1, rank 0): how long this worker's forward passes
+        # take and how long it sits between them, one line per interval.
+        self._wstep = os.environ.get("VLLM_UMBP_STEP_LOG") == "1" and (
+            codec is None or codec.tp_rank == 0
+        )
+        self._wstep_t0 = time.monotonic()
+        self._wstep_begin = 0.0
+        self._wstep_end = 0.0
+        self._wstep_acc = {"steps": 0, "fwd_s": 0.0, "idle_s": 0.0, "hook_s": 0.0,
+                           "loads": 0, "load_keys": 0, "idle_max": 0.0, "fwd_max": 0.0}
+
+    def _wstep_start(self) -> None:
+        now = time.monotonic()
+        acc = self._wstep_acc
+        if self._wstep_end:
+            idle = now - self._wstep_end
+            acc["idle_s"] += idle
+            acc["idle_max"] = max(acc["idle_max"], idle)
+        self._wstep_begin = now
+
+    def _wstep_finish(self, hook_started: float) -> None:
+        now = time.monotonic()
+        acc = self._wstep_acc
+        if self._wstep_begin:
+            fwd = hook_started - self._wstep_begin
+            acc["steps"] += 1
+            acc["fwd_s"] += fwd
+            acc["fwd_max"] = max(acc["fwd_max"], fwd)
+        acc["hook_s"] += now - hook_started
+        self._wstep_end = now
+        self._wstep_begin = 0.0
+        if now - self._wstep_t0 >= 10.0:
+            logger.info(
+                "K3WSTEP dt=%.1f steps=%d fwd_s=%.3f idle_s=%.3f hook_s=%.3f "
+                "fwd_max=%.3f idle_max=%.3f loads=%d load_keys=%d",
+                now - self._wstep_t0, acc["steps"], acc["fwd_s"], acc["idle_s"],
+                acc["hook_s"], acc["fwd_max"], acc["idle_max"], acc["loads"],
+                acc["load_keys"],
+            )
+            self._wstep_t0 = now
+            for key in acc:
+                acc[key] = 0 if isinstance(acc[key], int) else 0.0
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self.layout is not None and self.layout.regions:
@@ -114,10 +164,15 @@ class UMBPStoreConnectorWorker:
         self, forward_context: ForwardContext, metadata: UMBPConnectorMetadata
     ) -> None:
         del forward_context
+        if self._wstep:
+            self._wstep_start()
         self._report_load_completions = metadata.async_load
         for request_id, plans in metadata.load_requests.items():
             if plans:
                 self._submit_loads(request_id, plans)
+                if self._wstep:
+                    self._wstep_acc["loads"] += 1
+                    self._wstep_acc["load_keys"] += len(plans)
         if not metadata.async_load:
             self._drain_load_jobs(wait=True)
 
@@ -145,6 +200,8 @@ class UMBPStoreConnectorWorker:
             if job is not None:
                 self._stats.record("load", submitted=len(plans))
                 self._load_jobs[request_id] = {None: job}
+                if self._phd:
+                    self._phd_t[id(job)] = (time.monotonic(), "load")
                 return
         materialized = self._materialize_plans(list(plans))
         logger.debug(
@@ -161,6 +218,24 @@ class UMBPStoreConnectorWorker:
         self, request_id: str, result: TransferJobState, *, is_load: bool
     ) -> bool:
         operation = "load" if is_load else "store"
+        if self._phd and is_load:
+            t0, _ = self._phd_t.pop(id(result), (None, "?"))
+            logger.info(
+                "PHD wload req=%s keys=%d done=%d failed=%d bytes=%d lat=%s status=%s",
+                request_id, len(result.keys), len(result.completed_keys),
+                len(result.failed_keys), result.completed_bytes,
+                "%.3f" % (time.monotonic() - t0) if t0 is not None else "?",
+                result.status.value,
+            )
+        if self._phd and not is_load:
+            t0, groups = self._phd_t.pop(id(result), (None, "?"))
+            logger.info(
+                "PHD wstore req=%s keys=%d done=%d failed=%d groups=%s lat=%s status=%s",
+                request_id, len(result.keys), len(result.completed_keys),
+                len(result.failed_keys), groups,
+                "%.3f" % (time.monotonic() - t0) if t0 is not None else "?",
+                result.status.value,
+            )
         self._stats.record(
             operation,
             completed=len(result.completed_keys),
@@ -226,6 +301,14 @@ class UMBPStoreConnectorWorker:
         self._drain_load_jobs(wait=True)
 
     def wait_for_save(self) -> None:
+        hook_started = time.monotonic() if self._wstep else 0.0
+        try:
+            self._wait_for_save()
+        finally:
+            if self._wstep:
+                self._wstep_finish(hook_started)
+
+    def _wait_for_save(self) -> None:
         if self._store_jobs or self._active_store_event >= 0:
             self._pending_stores.append(
                 _StoreBatch(self._active_store_event, self._store_jobs)
@@ -280,6 +363,7 @@ class UMBPStoreConnectorWorker:
             job = store_blocks(localized)
             if job is not None:
                 self._stats.record("store", submitted=len(plans))
+                self._phd_note(job, plans)
                 self._store_jobs[request_id] = job
                 return
         materialized = self._materialize_plans(list(plans))
@@ -288,6 +372,14 @@ class UMBPStoreConnectorWorker:
             submitted=len(materialized),
         )
         self._store_jobs[request_id] = self.runtime.store(materialized)
+        self._phd_note(self._store_jobs[request_id], materialized)
+
+    def _phd_note(self, job, plans) -> None:
+        if not self._phd:
+            return
+        gids = plans.group_ids if isinstance(plans, BlockStoreBatch) else [p.group_id for p in plans]
+        groups = ",".join(f"{g}:{n}" for g, n in sorted(Counter(gids).items()))
+        self._phd_t[id(job)] = (time.monotonic(), groups)
 
     def enqueue_stores(self, metadata: UMBPConnectorMetadata) -> None:
         self._active_store_event = metadata.store_event

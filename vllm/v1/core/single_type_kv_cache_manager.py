@@ -2878,3 +2878,59 @@ def register_all_kvcache_specs(vllm_config):
     from vllm.platforms import current_platform
 
     current_platform.register_custom_kv_cache_specs(vllm_config)
+
+
+# ---- prefix-hit debug wrappers (image patch, VLLM_PREFIX_HIT_DEBUG=1) ----
+import os as _phd_os
+
+if _phd_os.environ.get("VLLM_PREFIX_HIT_DEBUG") == "1":
+    from vllm.logger import init_logger as _phd_init_logger
+
+    _phd_logger = _phd_init_logger("vllm.prefix_hit_debug")
+
+    _phd_first_gid = []
+
+    def _phd_first(self):
+        if not _phd_first_gid:
+            _phd_first_gid.append(self.kv_cache_group_id)
+        return self.kv_cache_group_id == _phd_first_gid[0]
+
+    _phd_orig_take = MambaManager.take_pending_boundary_state_offloads
+    _phd_orig_fin = MambaManager.finalize_partial_tail_offload
+
+    def _phd_take(self):
+        pending = _phd_orig_take(self)
+        if pending and _phd_first(self):
+            for request_id, _gid, _block, boundary in pending:
+                _phd_logger.info("PHD handoff req=%s boundary=%d", request_id, boundary)
+        return pending
+
+    def _phd_fin(self, request_id, num_computed_tokens, num_in_flight_tokens):
+        producer = getattr(self, "_producer_partial_tail_reqs", {}).get(request_id)
+        result = _phd_orig_fin(self, request_id, num_computed_tokens, num_in_flight_tokens)
+        if _phd_first(self):
+            _phd_logger.info(
+                "PHD finalize req=%s producer_boundary=%s computed=%d in_flight=%d handed=%s",
+                request_id, None if producer is None else producer[1],
+                num_computed_tokens, num_in_flight_tokens, result is not None,
+            )
+        return result
+
+    if hasattr(MambaManager, "_offer_checkpoint_boundary"):
+        _phd_orig_offer = MambaManager._offer_checkpoint_boundary
+
+        def _phd_offer(self, request):
+            before = len(self._pending_boundary_state_offloads)
+            _phd_orig_offer(self, request)
+            if _phd_first(self):
+                checkpoint = self._checkpoints.get(request.request_id)
+                _phd_logger.info(
+                    "PHD offer req=%s prompt=%d checkpoint=%s offered=%s",
+                    request.request_id, request.num_prompt_tokens,
+                    None if checkpoint is None else checkpoint[0],
+                    len(self._pending_boundary_state_offloads) > before,
+                )
+
+        MambaManager._offer_checkpoint_boundary = _phd_offer
+    MambaManager.take_pending_boundary_state_offloads = _phd_take
+    MambaManager.finalize_partial_tail_offload = _phd_fin

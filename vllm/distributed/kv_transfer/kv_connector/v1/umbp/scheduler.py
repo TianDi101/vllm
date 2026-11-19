@@ -68,6 +68,84 @@ from .runtime import UMBPSchedulerHandle
 logger = init_logger(__name__)
 
 
+class _StepLog:
+    """VLLM_UMBP_STEP_LOG=1: where the engine core's scheduling time goes.
+
+    One `K3STEP` line per interval from the scheduler process: steps, tokens scheduled and
+    how full the steps were, time inside schedule() / update_from_output() (core methods,
+    timed by wrapping them), time inside this connector's lookups, and lookup latency.
+    The worker's `K3WSTEP` line (worker.py) has the forward and idle time of rank 0.
+    """
+
+    INTERVAL_S = 10.0
+
+    def __init__(self) -> None:
+        self.t0 = time.monotonic()
+        self.acc: dict[str, float] = {}
+        self.lookup_lat: list[float] = []
+        self._install_core_timers()
+
+    def add(self, key: str, value: float = 1.0) -> None:
+        self.acc[key] = self.acc.get(key, 0.0) + value
+
+    def lookup_done(self, seconds: float) -> None:
+        self.lookup_lat.append(seconds)
+
+    def _install_core_timers(self) -> None:
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        first = not hasattr(Scheduler, "_umbp_step_log")
+        Scheduler._umbp_step_log = self  # type: ignore[attr-defined]
+        if not first:
+            return
+        schedule, update = Scheduler.schedule, Scheduler.update_from_output
+
+        def timed_schedule(sched, *args, **kwargs):
+            started = time.monotonic()
+            try:
+                return schedule(sched, *args, **kwargs)
+            finally:
+                Scheduler._umbp_step_log.add("sched_s", time.monotonic() - started)
+                Scheduler._umbp_step_log.add("sched_n")
+
+        def timed_update(sched, *args, **kwargs):
+            started = time.monotonic()
+            try:
+                return update(sched, *args, **kwargs)
+            finally:
+                Scheduler._umbp_step_log.add("update_s", time.monotonic() - started)
+
+        Scheduler.schedule = timed_schedule  # type: ignore[method-assign]
+        Scheduler.update_from_output = timed_update  # type: ignore[method-assign]
+
+    def step(self, tokens: int, requests: int, loads: int, budget: int) -> None:
+        self.add("steps")
+        self.add("tokens", tokens)
+        self.add("reqs", requests)
+        self.add("loads", loads)
+        self.add("full" if tokens >= budget - 256 else ("part" if tokens else "empty"))
+        now = time.monotonic()
+        if now - self.t0 < self.INTERVAL_S:
+            return
+        acc, lat = self.acc, sorted(self.lookup_lat)
+        g = lambda key: acc.get(key, 0.0)  # noqa: E731
+        logger.info(
+            "K3STEP dt=%.1f steps=%d tokens=%d full=%d part=%d empty=%d reqs=%d loads=%d "
+            "sched_n=%d sched_s=%.3f update_s=%.3f bcm_s=%.3f gnnmt_n=%d gnnmt_none=%d "
+            "gnnmt_s=%.3f await_s=%.3f await_n=%d lookups=%d lookup_ms_mean=%.1f "
+            "lookup_ms_p90=%.1f lookup_ms_max=%.1f",
+            now - self.t0, g("steps"), g("tokens"), g("full"), g("part"), g("empty"),
+            g("reqs"), g("loads"), g("sched_n"), g("sched_s"), g("update_s"), g("bcm_s"),
+            g("gnnmt_n"), g("gnnmt_none"), g("gnnmt_s"), g("await_s"), g("await_n"),
+            len(lat), 1e3 * sum(lat) / len(lat) if lat else 0.0,
+            1e3 * lat[int(0.9 * (len(lat) - 1))] if lat else 0.0,
+            1e3 * lat[-1] if lat else 0.0,
+        )
+        self.t0 = now
+        self.acc = {}
+        self.lookup_lat = []
+
+
 @lru_cache(maxsize=8192)
 def _rank_keys(
     codec: BlockIdentityCodec,
@@ -280,6 +358,10 @@ class UMBPStoreConnectorScheduler:
         # hit, pool (external) hit and an infinite-cache bound, the longest prefix
         # of its block hashes that any earlier request produced (debug only).
         self._hit_log = os.environ.get("VLLM_UMBP_HIT_LOG", "0") == "1"
+        self._step_log = (
+            _StepLog() if os.environ.get("VLLM_UMBP_STEP_LOG", "0") == "1" else None
+        )
+        self._step_budget = vllm_config.scheduler_config.max_num_batched_tokens
         # block hash -> first request carrying it; request -> finish time
         self._hit_log_seen: dict[Any, str] = {}
         self._hit_log_finished: dict[str, float] = {}
@@ -436,6 +518,20 @@ class UMBPStoreConnectorScheduler:
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
+        log = self._step_log
+        if log is None:
+            return self._get_num_new_matched_tokens(request, num_computed_tokens)
+        started = time.monotonic()
+        result = self._get_num_new_matched_tokens(request, num_computed_tokens)
+        log.add("gnnmt_s", time.monotonic() - started)
+        log.add("gnnmt_n")
+        if result[0] is None:
+            log.add("gnnmt_none")
+        return result
+
+    def _get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
         if self._hit_log:
             self._hit_log_local[request.request_id] = num_computed_tokens
         if not self.enable_lookup:
@@ -483,6 +579,11 @@ class UMBPStoreConnectorScheduler:
                     context,
                     self._lookup_executor.submit(self._lookup_all_ranks, context.keys),
                 )
+                if self._step_log is not None:
+                    submitted, log = time.monotonic(), self._step_log
+                    pending.future.add_done_callback(
+                        lambda _f: log.lookup_done(time.monotonic() - submitted)
+                    )
                 if not self._await_lookup(pending.future):
                     self._pending_lookups[request.request_id] = pending
                     return None, False
@@ -588,7 +689,11 @@ class UMBPStoreConnectorScheduler:
             return future.done()
         started = time.monotonic()
         wait_futures((future,), timeout=timeout)
-        self._lookup_budget_left_s -= time.monotonic() - started
+        waited = time.monotonic() - started
+        self._lookup_budget_left_s -= waited
+        if self._step_log is not None:
+            self._step_log.add("await_s", waited)
+            self._step_log.add("await_n")
         return future.done()
 
     def _lookup_all_ranks(self, keys: Sequence[str]) -> list[bool]:
@@ -797,6 +902,24 @@ class UMBPStoreConnectorScheduler:
         self._pending_loads[request.request_id] = plans
 
     def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
+        log = self._step_log
+        if log is None:
+            return self._build_connector_meta(scheduler_output)
+        started = time.monotonic()
+        meta = self._build_connector_meta(scheduler_output)
+        log.add("bcm_s", time.monotonic() - started)
+        scheduled = scheduler_output.num_scheduled_tokens
+        log.step(
+            sum(scheduled.values()),
+            len(scheduled),
+            len(getattr(meta, "load_requests", ()) or ()),
+            self._step_budget,
+        )
+        return meta
+
+    def _build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         meta = UMBPConnectorMetadata(async_load=self.load_async)
@@ -1778,3 +1901,72 @@ class UMBPStoreConnectorScheduler:
         self._pending_lookups.clear()
         if self.runtime is not None:
             self.runtime.close()
+
+
+# ---- prefix-hit debug wrappers (image patch, VLLM_PREFIX_HIT_DEBUG=1) ----
+import os as _phd_os
+
+if _phd_os.environ.get("VLLM_PREFIX_HIT_DEBUG") == "1":
+    from vllm.logger import init_logger as _phd_init_logger
+
+    _phd_logger = _phd_init_logger("vllm.prefix_hit_debug")
+
+    _phd_orig_reg = UMBPStoreConnectorScheduler.register_finished_partial_tail
+    _phd_orig_bsp = UMBPStoreConnectorScheduler._add_boundary_state_plans
+
+    def _phd_reg(self, request, block_ids, partial_tail_offloads):
+        accepted = _phd_orig_reg(self, request, block_ids, partial_tail_offloads)
+        _phd_logger.info(
+            "PHD tailreg req=%s computed=%d boundaries=%s accepted=%s",
+            request.request_id, request.num_computed_tokens,
+            sorted({entry[2] for entry in partial_tail_offloads}), accepted,
+        )
+        return accepted
+
+    def _phd_bsp(self, offloads, meta, finished, preempted):
+        for request_id, entries in offloads.items():
+            _phd_logger.info(
+                "PHD bstore req=%s boundaries=%s finished=%s",
+                request_id, sorted({entry[2] for entry in entries}),
+                request_id in finished,
+            )
+        return _phd_orig_bsp(self, offloads, meta, finished, preempted)
+
+    _phd_orig_gnnmt = UMBPStoreConnectorScheduler.get_num_new_matched_tokens
+
+    def _phd_gnnmt(self, request, num_computed_tokens):
+        self._phd_cur_req = request.request_id
+        return _phd_orig_gnnmt(self, request, num_computed_tokens)
+
+    _phd_orig_coord = UMBPStoreConnectorScheduler._coordinate_external_hits
+
+    def _phd_coord(self, request_hashes, local_tokens, max_external_tokens,
+                   logical_objects_by_group, logical_hits_by_group):
+        result = _phd_orig_coord(self, request_hashes, local_tokens, max_external_tokens,
+                                 logical_objects_by_group, logical_hits_by_group)
+        try:
+            parts = []
+            for gid, hits in logical_hits_by_group.items():
+                unit = self._lookup_units[gid]
+                ends = [local_tokens + (i + 1) * unit for i, hit in enumerate(hits) if hit]
+                block = self.group_block_sizes[gid]
+                run = 0
+                for i in range(block // unit - 1, len(hits), block // unit):
+                    if not hits[i]:
+                        break
+                    run = local_tokens + (i + 1) * unit
+                parts.append("g%d:obj=%d,hit=%d,max=%s,blockrun=%d,last=%s" % (
+                    gid, len(hits), len(ends), ends[-1] if ends else 0, run, ends[-3:]))
+            _phd_logger.info(
+                "PHD lookup req=%s local=%d max_ext=%d load=%d %s",
+                getattr(self, "_phd_cur_req", None), local_tokens, max_external_tokens,
+                result[0], " ".join(parts),
+            )
+        except Exception as exc:  # debug only
+            _phd_logger.info("PHD lookup log failed: %r", exc)
+        return result
+
+    UMBPStoreConnectorScheduler.register_finished_partial_tail = _phd_reg
+    UMBPStoreConnectorScheduler._add_boundary_state_plans = _phd_bsp
+    UMBPStoreConnectorScheduler._coordinate_external_hits = _phd_coord
+    UMBPStoreConnectorScheduler.get_num_new_matched_tokens = _phd_gnnmt
