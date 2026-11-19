@@ -14,7 +14,9 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
+    get_mamba_window_checkpoints,
     is_mamba_prefill_checkpoint_valid,
+    mamba_tail_window,
 )
 
 
@@ -61,6 +63,41 @@ def compute_mamba_prefill_checkpoints(
         offsets.append(position - query_start if valid else 0)
         cols.append(cdiv(seq_len, mamba_block_size) - 2 if valid else -1)
     return offsets, cols
+
+
+def compute_mamba_window_checkpoints(
+    seq_lens: list[int],
+    query_lens: list[int],
+    internal_offsets: list[int],
+    internal_cols: list[int],
+    mamba_block_size: int,
+    checkpoint_alignment: int | None,
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Per-row `[K]` entries: tail-window candidates ascending, then the
+    internal checkpoint, zero-padded to the widest row. Every candidate is
+    proposed; the scheduler backs only the in-window ones with blocks, so the
+    rest gather `NULL_BLOCK_ID` and the kernels skip them."""
+    rows_off: list[list[int]] = []
+    rows_col: list[list[int]] = []
+    for seq_len, query_len, off, col in zip(
+        seq_lens, query_lens, internal_offsets, internal_cols
+    ):
+        query_start = seq_len - query_len
+        window = get_mamba_window_checkpoints(
+            query_start, seq_len, mamba_block_size, checkpoint_alignment
+        )
+        row_off = [p - query_start for p, _ in window]
+        row_col = [col for _, col in window]
+        if off:
+            row_off.append(off)
+            row_col.append(col)
+        rows_off.append(row_off)
+        rows_col.append(row_col)
+    width = max(1, max(len(r) for r in rows_off))
+    for row_off, row_col in zip(rows_off, rows_col):
+        row_off.extend([0] * (width - len(row_off)))
+        row_col.extend([-1] * (width - len(row_col)))
+    return rows_off, rows_col
 
 
 def _gather_checkpoint_state_indices(
@@ -140,6 +177,46 @@ class MambaPrefillCheckpointBuilder:
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
             num_hash_lookahead_tokens=self.vllm_config.num_hash_lookahead_tokens,
         )
+        device = m.query_start_loc.device
+        if mamba_tail_window() is not None:
+            # `[N, K]`: the walk exports every in-window state in one pass.
+            rows_off, rows_col = compute_mamba_window_checkpoints(
+                [seq_lens[row] for row in request_rows],
+                query_lens,
+                checkpoint_offsets,
+                checkpoint_cols,
+                mamba_block_size=block_size,
+                checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
+            )
+            flat_offsets = [o for row in rows_off for o in row]
+            if not any(flat_offsets):
+                return None
+            width = len(rows_off[0])
+            offsets_tensor = torch.tensor(
+                flat_offsets, dtype=torch.int32
+            ).reshape(len(rows_off), width)
+            cols_tensor = torch.tensor(
+                [c for row in rows_col for c in row], dtype=torch.int64
+            ).reshape(len(rows_col), width)
+            checkpoint_offsets_tensor = async_tensor_h2d(
+                offsets_tensor, dtype=torch.int32, device=device
+            )
+            checkpoint_cols_tensor = async_tensor_h2d(
+                cols_tensor, dtype=torch.int64, device=device
+            )
+            request_rows_tensor = async_tensor_h2d(
+                request_rows, dtype=torch.int64, device=device
+            ).unsqueeze(1)
+            return MambaPrefillCheckpointMetadata(
+                checkpoint_offsets_tensor,
+                _gather_checkpoint_state_indices(
+                    m.block_table_tensor, request_rows_tensor, checkpoint_cols_tensor
+                ),
+                offsets=flat_offsets,
+                query_lens=query_lens,
+                request_rows=request_rows_tensor,
+                block_cols=checkpoint_cols_tensor,
+            )
         if not any(checkpoint_offsets):
             return None
         checkpoint_offsets_tensor = async_tensor_h2d(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import math
 from collections import Counter
 from collections.abc import Collection, Sequence
@@ -1246,6 +1247,85 @@ def is_mamba_prefill_checkpoint_valid(
         and query_start < checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0
     )
+
+
+def mamba_tail_window() -> tuple[int, int] | None:
+    """`VLLM_MAMBA_TAIL_WINDOW="S:W"`: also keep a Mamba state every S tokens
+    over the last W tokens of each prompt, exported by the same prefill walk
+    (one kernel launch, no extra chunk stops). Unset: off."""
+    spec = os.environ.get("VLLM_MAMBA_TAIL_WINDOW", "")
+    if not spec:
+        return None
+    stride, width = (int(x) for x in spec.split(":"))
+    assert stride > 0 and width >= stride, spec
+    return stride, width
+
+
+def get_mamba_window_checkpoints(
+    query_start: int,
+    query_end: int,
+    mamba_block_size: int,
+    checkpoint_alignment: int | None,
+    prompt_len: int | None = None,
+) -> list[tuple[int, int]]:
+    """Tail-window states one prefill query exports, as (tokens, block column).
+
+    Positions are the S-multiples in `(query_start, query_end - B]`. A state is
+    pool-only (never hashed on GPU), so its column only has to be a fresh one
+    strictly between the initial-state column and the internal-checkpoint
+    column (`cdiv(query_end, B) - 2`). Its natural column `p // B - 1` usually
+    is; `p = query_end - B` would land on the checkpoint's, so it moves one
+    column down, which is free when S >= 2B. The worker calls this without
+    `prompt_len` and proposes all of them; the scheduler passes `prompt_len`,
+    keeps the last-W ones and backs only those with blocks, so the rest gather
+    null blocks and are skipped. A query ending on a window position leaves
+    that state in its running-state block (`MambaManager._window_end_state`).
+    """
+    window = mamba_tail_window()
+    if window is None or checkpoint_alignment is None or query_end <= query_start:
+        return []
+    stride, width = window
+    block = mamba_block_size
+    if stride % block:
+        return []
+    init_col = (query_start - 1) // block if query_start > 0 else -1
+    ckpt_col = cdiv(query_end, block) - 2
+    lo = query_start + 1
+    hi = query_end - block  # inclusive
+    # Columns are assigned over the worker's full candidate list, and only then is
+    # the scheduler's window applied, so both sides map a position to the same
+    # column. With S == B the moved state's column is another candidate's, so
+    # the moved one is dropped on both sides.
+    out: list[tuple[int, int]] = []
+    used: set[int] = set()
+    for p in range(cdiv(max(lo, 1), stride) * stride, hi + 1, stride):
+        if (p - query_start) % checkpoint_alignment:
+            continue
+        col = p // block - 1
+        if col >= ckpt_col:
+            col = ckpt_col - 1
+        if col <= init_col or col in used:
+            continue
+        used.add(col)
+        out.append((p, col))
+    if prompt_len is not None:
+        out = [(p, c) for p, c in out if prompt_len - width <= p <= prompt_len - 1]
+    return out
+
+
+def get_mamba_window_checkpoint_positions(
+    query_start: int,
+    query_end: int,
+    mamba_block_size: int,
+    checkpoint_alignment: int | None,
+    prompt_len: int | None = None,
+) -> list[int]:
+    return [
+        p
+        for p, _ in get_mamba_window_checkpoints(
+            query_start, query_end, mamba_block_size, checkpoint_alignment, prompt_len
+        )
+    ]
 
 
 @dataclass(frozen=True)

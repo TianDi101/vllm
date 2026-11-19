@@ -38,7 +38,9 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     get_mamba_prefill_checkpoint_position,
+    get_mamba_window_checkpoints,
     is_mamba_prefill_checkpoint_valid,
+    mamba_tail_window,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -1470,6 +1472,13 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            # Tail-window states this step exports (VLLM_MAMBA_TAIL_WINDOW):
+            # (boundary tokens, block column). Backed by fresh blocks, never
+            # hashed on GPU, handed to the connector like a retained boundary.
+            self._window_cols: dict[str, list[tuple[int, int]]] = {}
+            # A step that ends on a window position (a budget split) leaves
+            # that state in its running-state block: offer it, nothing to add.
+            self._window_end: dict[str, tuple[int, int]] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1694,6 +1703,41 @@ class MambaManager(SingleTypeKVCacheManager):
             )
         )
 
+    def _window_checkpoints(
+        self, query_start: int, query_end: int, num_prompt_tokens: int
+    ) -> list[tuple[int, int]]:
+        """In-window tail states this query exports, as (tokens, column)."""
+        if not self.has_prefill_checkpoint_blocks or num_prompt_tokens <= 0:
+            return []
+        return get_mamba_window_checkpoints(
+            query_start,
+            query_end,
+            self.block_size,
+            self.kv_cache_spec.prefill_checkpoint_alignment,
+            prompt_len=num_prompt_tokens,
+        )
+
+    def _window_end_state(
+        self, query_start: int, query_end: int, num_prompt_tokens: int
+    ) -> tuple[int, int] | None:
+        """(tokens, column) when this query ends on a tail-window position
+        before the prompt end; its running-state block then holds that state."""
+        window = mamba_tail_window()
+        if (
+            window is None
+            or not self.has_prefill_checkpoint_blocks
+            or not query_start < query_end < num_prompt_tokens
+        ):
+            return None
+        stride, width = window
+        if (
+            query_end % stride
+            or query_end % self.block_size
+            or query_end < num_prompt_tokens - width
+        ):
+            return None
+        return query_end, query_end // self.block_size - 1
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -1704,6 +1748,7 @@ class MambaManager(SingleTypeKVCacheManager):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        num_prompt_tokens: int = 0,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if (
@@ -1778,7 +1823,21 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 checkpoint_position = 0
             checkpoint_block = int(checkpoint_position > 0)
+            window = self._window_checkpoints(
+                total_computed_tokens, num_tokens, num_prompt_tokens
+            )
             if not apply_admission_cap:
+                if window:
+                    self._window_cols[request_id] = window
+                else:
+                    self._window_cols.pop(request_id, None)
+                end_state = self._window_end_state(
+                    total_computed_tokens, num_tokens, num_prompt_tokens
+                )
+                if end_state is not None:
+                    self._window_end[request_id] = end_state
+                else:
+                    self._window_end.pop(request_id, None)
                 if checkpoint_position > 0:
                     checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
                     self._checkpoints[request_id] = (
@@ -1789,7 +1848,9 @@ class MambaManager(SingleTypeKVCacheManager):
                     self._checkpoints.pop(request_id, None)
             if num_new_blocks > 0:
                 blocks_allocated = request_id in self._allocated_block_reqs
-                physical_block_cap = 1 + int(has_partial_hit) + checkpoint_block
+                physical_block_cap = (
+                    1 + int(has_partial_hit) + checkpoint_block + len(window)
+                )
                 if not blocks_allocated:
                     physical_block_cap += self.num_speculative_blocks
                 num_new_blocks = min(num_new_blocks, physical_block_cap)
@@ -1825,6 +1886,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
             checkpoint_block = int(request_id in self._checkpoints)
+            window_cols = {col for _, col in self._window_cols.get(request_id, ())}
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
@@ -1833,6 +1895,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_required_blocks <= len(req_blocks)
                 and not has_partial_hit
                 and not checkpoint_block
+                and not window_cols
             ):
                 self._allocated_block_reqs.add(request_id)
                 return []
@@ -1859,25 +1922,38 @@ class MambaManager(SingleTypeKVCacheManager):
                     # minus the internal checkpoint block
                     # so we don't set null for that block
                     null_end = num_skipped_blocks - checkpoint_block
-                    req_blocks.extend(
-                        [self._null_block for _ in range(prev_block_len, null_end)]
-                    )
+                    for col in range(prev_block_len, null_end):
+                        # A tail-window column gets a real block the walk
+                        # exports into; the rest stay null.
+                        req_blocks.append(
+                            self.block_pool.get_new_blocks(1)[0]
+                            if col in window_cols
+                            else self._null_block
+                        )
 
+                kept_window_scratch = 0
                 if blocks_allocated:
                     # Relocate exclusively owned scratch blocks this step leaves
                     # behind. In a checkpoint step, one at the checkpoint index
                     # stays: the worker exports the checkpoint into that column.
+                    # One on a tail-window column stays too and takes that
+                    # state, so the tail needs one more fresh block instead.
                     for block_idx in range(
                         prev_block_len - self.num_speculative_blocks, prev_block_len
                     ):
                         if block_idx < num_skipped_blocks - checkpoint_block:
+                            if block_idx in window_cols:
+                                kept_window_scratch += 1
+                                continue
                             self._relocate_speculative_block(req_blocks, block_idx)
                         else:
                             break
                 num_new_blocks = max(num_required_blocks - len(req_blocks), 0)
                 if has_partial_hit:
                     num_new_blocks = max(num_new_blocks, 0) + 1
-                max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
+                max_new_blocks = (
+                    1 + int(has_partial_hit) + checkpoint_block + kept_window_scratch
+                )
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
                 assert num_new_blocks <= max_new_blocks
@@ -1958,6 +2034,8 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            self._window_cols.pop(request_id, None)
+            self._window_end.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
@@ -2003,6 +2081,7 @@ class MambaManager(SingleTypeKVCacheManager):
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
                 self._offer_checkpoint_boundary(request)
+            self._offer_window_states(request, num_tokens)
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):
@@ -2030,6 +2109,30 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
+
+    def _offer_window_states(self, request: Request, num_tokens: int) -> None:
+        """Hand this step's tail-window states to the connector (pool only).
+
+        A block that already has a hash is a retained boundary, which the
+        regular path has offered."""
+        window = list(self._window_cols.pop(request.request_id, None) or ())
+        end_state = self._window_end.pop(request.request_id, None)
+        if end_state is not None and end_state[0] == num_tokens:
+            window.append(end_state)
+        if not window:
+            return
+        blocks = self.req_to_blocks[request.request_id]
+        for position, col in window:
+            if (
+                position > num_tokens
+                or col >= len(blocks)
+                or blocks[col].is_null
+                or blocks[col].block_hash is not None
+            ):
+                continue
+            self._pending_boundary_state_offloads.append(
+                (request.request_id, self.kv_cache_group_id, blocks[col], position)
+            )
 
     def _offer_checkpoint_boundary(self, request: Request) -> None:
         """Offer an exported prefill checkpoint, re-keyed this step, to the connector.

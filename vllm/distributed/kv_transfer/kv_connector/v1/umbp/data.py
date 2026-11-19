@@ -660,6 +660,9 @@ class BlockTransferPlan:
     token_ids: tuple[int, ...] = ()
     block_size: int = 0
     medium: str = "CPU"
+    # Stored under the low eviction class (tail-window states and their
+    # attention tail pages, VLLM_MAMBA_TAIL_WINDOW).
+    low_priority: bool = False
 
 
 @dataclass(frozen=True)

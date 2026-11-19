@@ -13,6 +13,7 @@ from vllm.distributed.kv_events import BlockRemoved, KVCacheEvent
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
+from vllm.v1.kv_cache_interface import mamba_tail_window
 
 from .data import (
     BlockIdentityCodec,
@@ -187,9 +188,24 @@ class UMBPStoreConnectorWorker:
 
     def _mark_low_priority(self, result: TransferJobState) -> None:
         set_class = getattr(self.runtime, "set_eviction_class", None)
-        if not self._low_priority_group_ids or not callable(set_class):
+        if not callable(set_class):
             return
         plans = result.plans
+        if mamba_tail_window() is not None:
+            # Window mode: only the plans the scheduler flagged (tail-window
+            # states and their attention pages) are low class.
+            if isinstance(plans, (BlockLoadBatch, BlockStoreBatch)):
+                return
+            keys = [
+                plan.key
+                for plan in plans
+                if plan.low_priority and plan.key in result.completed_keys
+            ]
+            if keys:
+                set_class(keys, 1)
+            return
+        if not self._low_priority_group_ids:
+            return
         if isinstance(plans, (BlockLoadBatch, BlockStoreBatch)):
             entries = zip(plans.keys, plans.group_ids, strict=True)
         else:

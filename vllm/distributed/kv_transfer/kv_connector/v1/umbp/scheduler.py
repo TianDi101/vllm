@@ -45,6 +45,7 @@ from vllm.v1.kv_cache_interface import (
     SparseCacheRole,
     UniformTypeKVCacheSpecs,
     iter_layer_specs,
+    mamba_tail_window,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import KVConnectorOutput
@@ -208,6 +209,15 @@ class UMBPStoreConnectorScheduler:
             if isinstance(group.kv_cache_spec, MambaSpec)
             and getattr(group.kv_cache_spec, "mamba_cache_mode", None) == "align"
         )
+        # Tail-window states (VLLM_MAMBA_TAIL_WINDOW) are speculative: most are
+        # never hit, so they and their attention tail pages go under the low
+        # eviction class; every other boundary stays class 0.
+        self._window_block_size = (
+            min(self.group_block_sizes[g] for g in self._boundary_handoff_groups)
+            if mamba_tail_window() is not None and self._boundary_handoff_groups
+            else 0
+        )
+        self._full_block_size = max(self.group_block_sizes.values(), default=0)
         # Full-attention groups, including a group that wraps several attention
         # layer specs (target and draft layers sharing a block table).
         self._attention_tail_groups = frozenset(
@@ -633,8 +643,16 @@ class UMBPStoreConnectorScheduler:
         keys: list[str] = []
         for group_id in self.kv_cache_config.prefix_cacheable_group_ids:
             if group_id in self._boundary_handoff_groups:
-                # The hit resumes from the state checkpoint at its end.
-                ends: Sequence[int] = (hit_tokens,)
+                # The hit resumes from the state checkpoint at its end. The retained
+                # states below it are where later requests branching inside this
+                # prefix resume; a GPU hit never reads them back from the pool, so
+                # without a touch they age from their first store and go first.
+                step = self._retention_interval
+                if step is None:
+                    step = self.block_size
+                ends: Sequence[int] = (
+                    list(range(step, hit_tokens, step)) if step else []
+                ) + [hit_tokens]
             else:
                 block = self.group_block_sizes[group_id]
                 ends = list(range(block, hit_tokens + 1, block))
@@ -998,6 +1016,7 @@ class UMBPStoreConnectorScheduler:
                 )
                 continue
             plans: list[BlockTransferPlan] = []
+            window = self._window_boundaries(request)
             for group_id, block_id, boundary_tokens in entries:
                 if group_id not in prefix_groups or block_id == NULL_BLOCK_ID:
                     continue
@@ -1020,17 +1039,19 @@ class UMBPStoreConnectorScheduler:
                             else None
                         ),
                         block_size=self.group_block_sizes[group_id],
+                        low_priority=boundary_tokens in window,
                     )
                 )
             boundaries = {
                 plan_boundary for _, _, plan_boundary in entries if plan_boundary > 0
             }
             for boundary_tokens in sorted(boundaries):
-                plans.extend(
-                    self._attention_tail_plans(
-                        request_id, request, tracker.block_ids, boundary_tokens
-                    )
+                tail = self._attention_tail_plans(
+                    request_id, request, tracker.block_ids, boundary_tokens
                 )
+                if boundary_tokens in window:
+                    tail = [replace(plan, low_priority=True) for plan in tail]
+                plans.extend(tail)
             logger.debug(
                 "UMBP boundary offloads request=%s offered=%d stored=%d boundaries=%s",
                 request_id,
@@ -1040,6 +1061,23 @@ class UMBPStoreConnectorScheduler:
             )
             if plans:
                 meta.store_plans.extend(plans)
+
+    def _window_boundaries(self, request: Any) -> frozenset[int]:
+        """Tail-window state positions of `request`'s prompt (low class)."""
+        if not self._window_block_size:
+            return frozenset()
+        window = mamba_tail_window()
+        assert window is not None
+        stride, width = window
+        prompt = request.num_prompt_tokens
+        # In-step states sit at most at `prompt - B`; a step end inside the
+        # last block and the prompt-tail checkpoint stay class 0.
+        first = max(prompt - width, 1)
+        return frozenset(
+            p
+            for p in range(-(-first // stride) * stride, prompt - self._window_block_size + 1, stride)
+            if p % self._window_block_size == 0 and p % self._full_block_size
+        )
 
     def _attention_tail_plans(
         self,

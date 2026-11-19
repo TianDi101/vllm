@@ -202,6 +202,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        num_prompt_tokens: int = 0,
     ) -> int:
         """Get the number of device blocks needed to be allocated for the request.
 
@@ -250,6 +251,13 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
+                # Mamba keys its tail-window states on the prompt length, which
+                # `prefill_end` no longer carries under sparse retention.
+                extra = (
+                    {"num_prompt_tokens": num_prompt_tokens}
+                    if isinstance(manager, MambaManager)
+                    else {}
+                )
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
@@ -259,6 +267,7 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                     prefill_end=prefill_end,
+                    **extra,
                 )
         return num_blocks_to_allocate
 
