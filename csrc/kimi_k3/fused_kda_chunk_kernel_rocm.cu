@@ -146,17 +146,20 @@ struct Params {
   // consecutive addresses.
   bf16_t* mgT;
   // Prefill checkpoint export, mirroring FlashKDA's `checkpoint_state` /
-  // `checkpoint_offsets`.  `ckoff[n]` is a token offset relative to sequence
-  // n's first query token; 0 disables the export for that sequence.  The walk
-  // snapshots the state it holds at that offset into `ckpt`, so a later
-  // prefix-cache hit can resume from a mamba block boundary instead of
-  // replaying the tail as a second model forward.  `ckidx`, when present,
-  // redirects sequence n's snapshot to row `ckidx[n]`, which lets the store go
-  // straight into the paged state cache; a negative row disables it.
+  // `checkpoint_offsets`.  Sequence n owns `ckn` entries, `ckoff[n * ckn + j]`,
+  // each a token offset relative to its first query token; 0 disables an
+  // entry.  The walk snapshots the state it holds at each offset into `ckpt`,
+  // so a later prefix-cache hit can resume from a mamba block boundary instead
+  // of replaying the tail as a second model forward.  `ckidx`, when present,
+  // redirects entry e's snapshot to row `ckidx[e]`, which lets the store go
+  // straight into the paged state cache; a negative row disables it.  Without
+  // `ckidx`, entry e lands in staging row e.  A sequence's non-zero offsets
+  // must be ascending.
   void* ckpt;
   bool ckpt_bf16;
   const int* ckoff;
   const int* ckidx;
+  int ckn;
   int G;
   int NHv;
   __device__ __forceinline__ int64_t NH() const { return NHv; }
@@ -675,14 +678,8 @@ __global__ __launch_bounds__(64 * WAVES * KS,
   const int T = p.cu[n + 1] - bos;
   const int nt_all = (T + kBT - 1) / kBT;
   const int64_t choff = p.choff[n];
-  // Loaded unconditionally, alongside `cu` / `choff`, so all of a block's
-  // scalar reads issue in one batch. With the export off the pair reads an
-  // already-live pointer and the values are discarded.
   const bool ck_on = PASS2 && p.ckpt != nullptr;
   const bool ck_ridx = ck_on && p.ckidx != nullptr;
-  const int ck_off = ck_on ? (ck_on ? p.ckoff : p.cu)[n] : 0;
-  const int ck_row_raw = (ck_ridx ? p.ckidx : p.cu)[n];
-  const int ck_row = ck_ridx ? ck_row_raw : n;
   // Even split, remainder to the low groups, so every group is within one
   // chunk of the same length and no group is empty when G <= nt_all.
   const int per = nt_all / G, rem = nt_all % G;
@@ -727,17 +724,34 @@ __global__ __launch_bounds__(64 * WAVES * KS,
   // the walk only passes through multiples of kBT -- and is dropped here; the
   // metadata builder is the enforcement point, so that a position the kernel
   // will not write is never hashed as a cache block.
+  // A sequence may own several entries: `ck_seek(from)` moves the cursor to
+  // the first one at local chunk `from` or later, and the walk re-seeks after
+  // each store.  All reads are block-uniform.
   int ck_local = -1;
   int64_t ck_dst = 0;
-  if constexpr (PASS2) {
-    const int ck = ck_off / kBT - 1;
-    if (ck_off > 0 && ck_off % kBT == 0 && ck >= c0 && ck < c0 + nt &&
-        ck_row >= 0) {
-      ck_local = ck - c0;
-      ck_dst = static_cast<int64_t>(ck_row) * p.ckrow +
-               static_cast<int64_t>(h) * kV * kK;
+  int ck_j = 0;
+  auto ck_seek = [&](int from) {
+    ck_local = -1;
+    if constexpr (PASS2) {
+      while (ck_on && ck_j < p.ckn) {
+        const int64_t e = static_cast<int64_t>(n) * p.ckn + ck_j++;
+        const int off = p.ckoff[e];
+        if (off <= 0 || off % kBT != 0 || off > T) continue;
+        const int ck = off / kBT - 1;
+        if (ck < c0 + from) continue;
+        if (ck >= c0 + nt) {
+          ck_j = p.ckn;  // ascending: none of the rest is in this group
+          break;
+        }
+        const int64_t row = ck_ridx ? static_cast<int64_t>(p.ckidx[e]) : e;
+        if (row < 0) continue;
+        ck_local = ck - c0;
+        ck_dst = row * p.ckrow + static_cast<int64_t>(h) * kV * kK;
+        break;
+      }
     }
-  }
+  };
+  ck_seek(0);
 
   const int64_t ld_k = static_cast<int64_t>(p.H) * kK;
   const int64_t ld_v = static_cast<int64_t>(p.H) * kV;
@@ -1032,7 +1046,10 @@ __global__ __launch_bounds__(64 * WAVES * KS,
       stage_decay(dn, nxt);
     }
 
-    if (c == ck_local) store_checkpoint();
+    if (c == ck_local) {
+      store_checkpoint();
+      ck_seek(c + 1);
+    }
     if constexpr (KS > 1) publish_s();
 
     bf16_t* op = out + static_cast<int64_t>(c) * kBT * ld_v;
@@ -1058,7 +1075,10 @@ __global__ __launch_bounds__(64 * WAVES * KS,
       vnf_read();
     }
     phase_b(cur, dl);
-    if (c == ck_local) store_checkpoint();
+    if (c == ck_local) {
+      store_checkpoint();
+      ck_seek(c + 1);
+    }
     bf16_t* op = out + static_cast<int64_t>(c) * kBT * ld_v;
     if constexpr (PASS2)
       for (int vt = 0; vt < kNV; ++vt)
@@ -2139,6 +2159,7 @@ void fused_kda_chunk(
   void* ckpt_ptr = nullptr;
   int const* ckoff_ptr = nullptr;
   int const* ckidx_ptr = nullptr;
+  int ckn = 1;
   if (checkpoint_state.has_value() || checkpoint_offsets.has_value()) {
     STD_TORCH_CHECK(
         checkpoint_state.has_value() && checkpoint_offsets.has_value(),
@@ -2158,27 +2179,31 @@ void fused_kda_chunk(
         "whose "
         "rows are dense; stride(0) may be padded, as the paged state cache "
         "it usually is");
+    // [N] or [N, K]: K entries per sequence, row-major.
     STD_TORCH_CHECK(checkpoint_offsets->is_cuda() &&
                         checkpoint_offsets->is_contiguous() &&
                         checkpoint_offsets->scalar_type() == ScalarType::Int &&
-                        checkpoint_offsets->numel() == num_seqs,
+                        num_seqs > 0 &&
+                        checkpoint_offsets->numel() % num_seqs == 0 &&
+                        checkpoint_offsets->numel() >= num_seqs,
                     "checkpoint_offsets must be a contiguous int32 GPU tensor "
-                    "with one entry per sequence");
+                    "with K >= 1 entries per sequence");
+    ckn = static_cast<int>(checkpoint_offsets->numel() / num_seqs);
     if (checkpoint_state_indices.has_value()) {
       STD_TORCH_CHECK(
           checkpoint_state_indices->is_cuda() &&
               checkpoint_state_indices->is_contiguous() &&
               checkpoint_state_indices->scalar_type() == ScalarType::Int &&
-              checkpoint_state_indices->numel() == num_seqs,
+              checkpoint_state_indices->numel() == checkpoint_offsets->numel(),
           "checkpoint_state_indices must be a contiguous int32 GPU tensor "
-          "with one entry per sequence");
+          "shaped like checkpoint_offsets");
       ckidx_ptr = static_cast<int const*>(checkpoint_state_indices->data_ptr());
     } else {
-      STD_TORCH_CHECK(checkpoint_state->size(0) >= num_seqs,
-                      "checkpoint_state needs one row per sequence when no "
-                      "checkpoint_state_indices are given, got ",
-                      checkpoint_state->size(0), " rows for ", num_seqs,
-                      " sequences");
+      STD_TORCH_CHECK(checkpoint_state->size(0) >= num_seqs * ckn,
+                      "checkpoint_state needs one row per checkpoint entry "
+                      "when no checkpoint_state_indices are given, got ",
+                      checkpoint_state->size(0), " rows for ", num_seqs * ckn,
+                      " entries");
     }
     ckpt_ptr = checkpoint_state->data_ptr();
     ckoff_ptr = static_cast<int const*>(checkpoint_offsets->data_ptr());
@@ -2271,6 +2296,7 @@ void fused_kda_chunk(
                      checkpoint_state->scalar_type() == ScalarType::BFloat16;
   params.ckoff = ckoff_ptr;
   params.ckidx = ckidx_ptr;
+  params.ckn = ckn;
 
   // Wave growth is chosen after G, because the split multiplies the workgroup
   // count by G and only one workgroup is resident per CU at this LDS

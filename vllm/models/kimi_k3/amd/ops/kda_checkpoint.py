@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Conv half of the ROCm Kimi-K3 prefill checkpoint."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -30,6 +30,17 @@ class KimiK3ROCmKDAPrefillCheckpointExporter(FlashKDAPrefillCheckpointExporter):
         cu_seqlens: torch.Tensor,
     ) -> None:
         assert self.state_len is not None
+        offsets = checkpoint.checkpoint_offsets
+        if offsets.dim() == 2:
+            # `[N, K]` (tail window): one program per entry, each reading its
+            # own sequence's query start.
+            width = offsets.shape[1]
+            checkpoint = replace(
+                checkpoint,
+                checkpoint_offsets=offsets.reshape(-1),
+                state_indices=checkpoint.state_indices.reshape(-1),
+            )
+            cu_seqlens = cu_seqlens[: offsets.shape[0]].repeat_interleave(width)
         # An empty recurrent checkpoint masks the kernel's recurrent half off.
         super().export(
             checkpoint,

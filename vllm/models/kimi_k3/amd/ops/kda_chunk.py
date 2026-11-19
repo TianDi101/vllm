@@ -8,6 +8,7 @@ path with a single launch that keeps the per-chunk state in registers, so the
 `[chunks, H, V, K]` state tensor and the recomputed values never reach HBM.
 """
 
+import os
 from functools import cache
 
 import torch
@@ -36,6 +37,17 @@ def _hip_checkpoint_state_indices(state_indices: torch.Tensor) -> torch.Tensor:
         .to(torch.int32)
         .contiguous()
     )
+
+
+@cache
+def _fused_kda_chunk_op():
+    """`VLLM_K3KDA_EXT_LIB` points at a standalone build that can export
+    several checkpoints per sequence; otherwise the op built into `_C`."""
+    lib = os.environ.get("VLLM_K3KDA_EXT_LIB")
+    if lib:
+        torch.ops.load_library(lib)
+        return torch.ops.k3kda.fused_kda_chunk
+    return torch.ops._C.fused_kda_chunk
 
 
 @cache
@@ -238,14 +250,16 @@ def fused_kda_chunk(
             fp32 or bf16 `[rows, H, 128, 128]`. Without
             `checkpoint_state_indices` it is a staging buffer indexed by
             sequence; with them it can be the paged state cache itself.
-        checkpoint_offsets: int32 `[N]` token offsets, each relative to its
-            sequence's first query token, at which to snapshot the recurrent
-            state. `0` disables the export for that sequence. A non-zero
+        checkpoint_offsets: int32 `[N]` or `[N, K]` token offsets, each
+            relative to its sequence's first query token, at which to snapshot
+            the recurrent state. `0` disables an entry. With `[N, K]` (the
+            `VLLM_K3KDA_EXT_LIB` build) a sequence exports up to K states,
+            which must be ascending among its non-zero entries. A non-zero
             offset must be a multiple of `KDA_CHECKPOINT_ALIGNMENT`;
             the kernel skips any that is not, so the caller has to filter
             rather than rely on the store happening.
-        checkpoint_state_indices: optional int32 `[N]` destination row per
-            sequence. A negative row disables the export for that sequence.
+        checkpoint_state_indices: optional int32 destination row per entry,
+            shaped like `checkpoint_offsets`. A negative row disables it.
         state_cache: the paged recurrent state, fp32 or bf16
             `[slots, H, 128, 128]`. When given, the walk reads sequence
             `n`'s initial state from row `state_indices[n]` and writes its
@@ -286,7 +300,7 @@ def fused_kda_chunk(
     groups = _chunk_groups(chunks_per_seq, num_seqs, u.shape[2])
     group_state = _kda_group_workspace(groups, num_seqs * u.shape[2], u.device)
 
-    torch.ops._C.fused_kda_chunk(
+    _fused_kda_chunk_op()(
         qg,
         w,
         u,
@@ -302,7 +316,9 @@ def fused_kda_chunk(
         group_state,
         groups,
         checkpoint_state,
-        None if checkpoint_offsets is None else checkpoint_offsets.to(torch.int32),
+        None
+        if checkpoint_offsets is None
+        else checkpoint_offsets.to(torch.int32).contiguous(),
         None
         if checkpoint_state_indices is None
         else _hip_checkpoint_state_indices(checkpoint_state_indices),
